@@ -23,8 +23,8 @@ Every bridge operation is observable. State lives in `<workspace>/plugins/mikied
 
 ## Resolving conflicts
 
-1. **Keep Cadet's version** — accept the refresh in **Mikiedi: Refresh from Cadet** (or op `resolve` with `action: "keep-cadet"`). The editor must then refresh before publishing again; the guard is automatic.
-2. **Keep the editor's version** — edit the SilverBullet copy to the intended final state and publish again (a fresh conflict is recorded and resolved), or op `resolve` with `action: "publish-sb"` and the resolved content.
+1. **Keep Cadet's version** — run **Mikiedi: Resolve conflict** and choose "Keep Cadet's version" (this also pulls Cadet's copy into the space and clears the conflict page), or op `resolve` with `action: "keep-cadet"`. The editor must then refresh before publishing again; the guard is automatic.
+2. **Keep the editor's version** — run **Mikiedi: Resolve conflict** and choose "Publish this space's version", or edit the SilverBullet copy to the intended final state and publish again (a fresh conflict is recorded and resolved), or op `resolve` with `action: "publish-sb"` and the resolved content.
 
 ## Recovery
 
@@ -32,6 +32,24 @@ Every bridge operation is observable. State lives in `<workspace>/plugins/mikied
 - **`state.json` lost:** safe to start empty — every page will report `adopt-required` until a fresh Adopt pass. Baselines only guard the editor's view; no canonical data lives in them.
 - **Journal is the intent record:** if you need to reconstruct what happened, read `journal.jsonl` newest-last. Each line names op, slug, outcome, previous and new hash.
 - **Before uninstalling the plugin**, archive `data/` — uninstall deletes it.
+
+## Pulling memory into SilverBullet (v0.2)
+
+**Mikiedi: Pull all pages from Cadet** fetches the whole store into the space under the pages' real slugs — this is the "import existing memory" step. Behavior:
+
+- Pages that don't exist in the space yet are written as-is.
+- Pages that exist in the space with different content are **never overwritten silently**; they are listed in the `Mikiedi/Pull` report. Use **Mikiedi: Refresh from Cadet** per page to force an overwrite.
+- Slugs can be excluded with the **Pull exclusions** setting (comma-separated exact slugs or prefixes).
+- A prefix-mapped mode (pages landing under a configurable namespace, e.g. `Memory/…`, for SilverBullet instances used for other things too) is a **planned** option — not implemented in v0.2; real slugs are the current contract.
+
+## Settings (Workbench → Configuration → Mikiedi)
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| Bridge URL | — | Full URL of the bridge ingress route |
+| Bridge token | — | Bearer token stored on the Cadet side |
+| Auto-refresh retrieval index | on | Publish/delete also invalidates Cadet's retrieval index |
+| Pull exclusions | empty | Slugs/prefixes `Pull all pages from Cadet` skips |
 
 ## Renames and folder moves (v0.1 limitation)
 

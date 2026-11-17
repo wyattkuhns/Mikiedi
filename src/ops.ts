@@ -90,7 +90,7 @@ function withMutex<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-const PLUGIN_VERSION = "0.1.0";
+const PLUGIN_VERSION = "0.2.0";
 
 function iso(deps: BridgeDeps): string {
   return (deps.now ?? (() => new Date()))().toISOString();
@@ -538,6 +538,29 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
       };
     }
 
+    case "fetchAll": {
+      const summaries = listConceptPages(deps.config.conceptsDir);
+      const pages = summaries.map((p) => {
+        const content = readTextOrNull(pagePath(deps.config.conceptsDir, p.slug));
+        return {
+          slug: p.slug,
+          content: content ?? "",
+          hash: content === null ? null : sha256Hex(content),
+          size: p.size,
+          mtime: p.mtimeIso,
+        };
+      });
+      return {
+        ok: true,
+        op: "fetchAll",
+        result: {
+          pages,
+          conflicts: Object.keys(state.conflicts),
+          generatedAt: iso(deps),
+        },
+      };
+    }
+
     case "validate": {
       const pages = (payload.pages ?? []) as StagedPage[];
       const results = pages.map((p) => {
@@ -644,7 +667,7 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
     default:
       return {
         ok: false,
-        error: `Mikiedi: unknown op '${String(op)}'. Valid ops: status, pages, page, validate, publish, delete, adopt, resolve, sync, refresh.`,
+        error: `Mikiedi: unknown op '${String(op)}'. Valid ops: status, pages, page, fetchAll, validate, publish, delete, adopt, resolve, sync, refresh.`,
       };
   }
 }

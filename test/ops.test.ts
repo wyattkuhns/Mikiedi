@@ -170,6 +170,24 @@ describe("publish flow", () => {
     expect((status as any).result.journalTail.at(-1).outcome).toBe("updated");
   });
 
+  test("fetchAll returns every page with content and hashes, read-only", async () => {
+    writeFileSync(join(conceptsDir(), "one.md"), page("one", "One"));
+    mkdirSync(join(conceptsDir(), "sub"), { recursive: true });
+    writeFileSync(join(conceptsDir(), "sub", "two.md"), page("two", "Two"));
+    const res = await call(deps(), { op: "fetchAll" });
+    const pages = (res as any).result.pages;
+    expect(pages.length).toBe(2);
+    const one = pages.find((p: any) => p.slug === "one");
+    const two = pages.find((p: any) => p.slug === "sub/two");
+    expect(one.content).toContain("One");
+    expect(one.hash).toBe(sha256Hex(one.content));
+    expect(two.content).toContain("Two");
+    expect(typeof one.mtime).toBe("string");
+    // read-only: nothing written to the store, no journal entry
+    expect(existsSync(join(conceptsDir(), "one.md"))).toBe(true);
+    expect(existsSync(join(dataDir, "journal.jsonl"))).toBe(false);
+  });
+
   test("existing page without baseline requires adopt", async () => {
     writeFileSync(join(conceptsDir(), "pre.md"), page("pre", "Pre-existing"));
     const res = await call(deps(), { op: "publish", pages: [{ slug: "pre", content: page("pre", "Edited") }] });

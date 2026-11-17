@@ -3,3 +3,7 @@ data/
 config.json
 *.log
 .DS_Store
+# local tool state, never ship
+.config/
+*.session
+.env

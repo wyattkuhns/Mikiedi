@@ -22,9 +22,12 @@ Commands (command palette):
 
 | Command | What it does |
 | --- | --- |
+| `Mikiedi: Pull all pages from Cadet` | Fetch the whole memory store into this space (real slugs); local edits are never overwritten |
 | `Mikiedi: Publish current page` | Validates and publishes this page into Cadet memory |
 | `Mikiedi: Publish pages…` | Pick a page to publish |
 | `Mikiedi: Refresh from Cadet` | Pull the canonical version of this page, with conflict safety |
+| `Mikiedi: Delete page from Cadet` | CAS-guarded deletion of this page from Cadet memory, with confirmations |
+| `Mikiedi: Resolve conflict` | Keep Cadet's version or publish this space's version for a recorded conflict |
 | `Mikiedi: Status` | Write a `Mikiedi/Status` page: sync state, conflicts, refresh state |
 | `Mikiedi: Adopt Cadet state` | Record baselines for pages that already exist in Cadet memory |
 
@@ -67,6 +70,26 @@ pcall(function()
         priority = 9,
         inputType = "password",
         description = "Bearer token stored on the Cadet side (field bridge_token, service mikiedi). Anyone who can edit this space could read it — that is the same trust level as publishing.",
+      },
+    })
+    config.define("mikiedi.autoRefresh", {
+      type = "boolean",
+      default = true,
+      ui = {
+        category = "Mikiedi",
+        label = "Auto-refresh retrieval index",
+        priority = 8,
+        description = "When on, every publish or delete also invalidates Cadet's retrieval index (the recommended default). Turn off only if the Cadet side refreshes on its own schedule.",
+      },
+    })
+    config.define("mikiedi.pullExclusions", {
+      type = "string",
+      default = "",
+      ui = {
+        category = "Mikiedi",
+        label = "Pull exclusions",
+        priority = 7,
+        description = "Comma-separated slug prefixes that 'Pull all pages from Cadet' skips, e.g. 'drafts/, scratch/'. Exact slugs also match. Empty means pull everything.",
       },
     })
   end
@@ -115,7 +138,30 @@ mikiedi.settings = function()
       token = text:match("bridgeToken%s*:%s*(%S+)") or ""
     end
   end
-  return url, token
+  local opts = { autoRefresh = true, pullExclusions = {} }
+  local okA, a = pcall(config.get, "mikiedi.autoRefresh", true)
+  if okA and type(a) == "boolean" then opts.autoRefresh = a end
+  local okX, x = pcall(config.get, "mikiedi.pullExclusions", "")
+  if okX and type(x) == "string" and x ~= "" then
+    for pat in x:gmatch("[^,]+") do
+      local p = pat:gsub("%s+", "")
+      if p ~= "" then table.insert(opts.pullExclusions, p) end
+    end
+  end
+  return url, token, opts
+end
+
+mikiedi.excluded_from_pull = function(slug, exclusions)
+  for _, pat in ipairs(exclusions or {}) do
+    if slug == pat or slug:sub(1, #pat) == pat then return true end
+  end
+  return false
+end
+
+mikiedi.refresh_flag = function()
+  local _, _, opts = mikiedi.settings()
+  if opts.autoRefresh then return nil end
+  return false -- explicit "do not refresh" for the bridge payload
 end
 
 mikiedi.call = function(payload)
@@ -172,8 +218,8 @@ mikiedi.conflict_page = function(slug, verdict, sbContent)
     "```",
     "",
     "Resolve from here: edit your copy to the intended final state and publish again " ..
-      "(the bridge will record a fresh conflict if Cadet changed), or keep Cadet's version " ..
-      "with **Mikiedi: Refresh from Cadet**, or resolve explicitly on the Cadet side with op `resolve`.",
+      "(the bridge will record a fresh conflict if Cadet changed), or run **Mikiedi: Resolve conflict** " ..
+      "to keep either side explicitly, or resolve on the Cadet side with op `resolve`.",
   }
   space.writePage(pageName, table.concat(lines, "\n"))
   return pageName
@@ -185,6 +231,8 @@ mikiedi.publish_pages = function(entries)
   for _, e in ipairs(entries) do
     table.insert(payload.pages, { slug = e.slug, content = e.content })
   end
+  local rf = mikiedi.refresh_flag()
+  if rf ~= nil then payload.refresh = rf end
   local resp = mikiedi.call(payload)
   local out = {}
   for _, r in ipairs(resp.result.pages) do
@@ -250,6 +298,17 @@ command.define {
         if editor.confirm("This page has no frontmatter. Prepend a Mikiedi scaffold (title, slug, empty tags and links)?") then
           text = table.concat({ "---", "title: " .. name, "slug: " .. name, "tags:", "links:", "---", "", text }, "\n")
           space.writePage(name, text)
+        end
+      end
+      -- Rename guard: a stale frontmatter slug after a rename would silently
+      -- publish under a different identity than the page says it is.
+      local fm = text:match("^%-%-%-\n(.-)\n%-%-%-")
+      if fm then
+        local declared = fm:match("^slug:%s*(%S+)")
+        if declared and declared ~= name then
+          if not editor.confirm("Frontmatter says slug: " .. declared .. ", but this page is '" .. name .. "'. Cadet identity comes from the page NAME ('" .. name .. "'). If you renamed this page, consider that cross-references in Cadet still point at the old slug.\n\nPublish anyway under '" .. name .. "'?") then
+            return
+          end
         end
       end
       mikiedi.publish_pages({ { slug = name, content = text } })
@@ -324,6 +383,188 @@ command.define {
       else
         editor.alert("Mikiedi: unexpected sync verdict: " .. tostring(v.action))
       end
+    end)
+    if not ok then editor.alert("Mikiedi error: " .. tostring(err)) end
+  end,
+}
+
+command.define {
+  name = "Mikiedi: Pull all pages from Cadet",
+  run = function()
+    local ok, err = pcall(function()
+      local url, token, opts = mikiedi.settings()
+      local resp = mikiedi.call({ op = "fetchAll" })
+      local pages = resp.result.pages
+      local candidates = {}
+      for _, p in ipairs(pages) do
+        if not mikiedi.excluded_from_pull(p.slug, opts.pullExclusions) then
+          table.insert(candidates, p)
+        end
+      end
+      if #candidates == 0 then
+        editor.alert("Mikiedi: Cadet memory has no pullable pages (or all are excluded by the pull-exclusions setting).")
+        return
+      end
+      if not editor.confirm("Pull " .. #candidates .. " pages from Cadet memory into this space?\n\nPages that do not exist here yet are written as-is. Pages that already exist here with DIFFERENT content are left untouched (your local edits win locally); they are listed in the report so you can decide per page with 'Mikiedi: Refresh from Cadet'.") then
+        return
+      end
+      local written, same, kept = {}, {}, {}
+      for _, p in ipairs(candidates) do
+        local exists, current = pcall(space.readPage, p.slug)
+        if exists and type(current) == "string" then
+          if current == p.content then
+            table.insert(same, p.slug)
+          else
+            table.insert(kept, p.slug)
+          end
+        else
+          space.writePage(p.slug, p.content)
+          table.insert(written, p.slug)
+        end
+      end
+      local lines = {
+        "# Mikiedi pull report",
+        "",
+        "Pulled from Cadet memory at " .. resp.result.generatedAt .. ".",
+        "",
+        "- Written into this space: **" .. #written .. "**",
+        "- Already identical: **" .. #same .. "**",
+        "- Kept local edits (Cadet copy differs — refresh per page to overwrite): **" .. #kept .. "**",
+        "",
+      }
+      if #kept > 0 then
+        table.insert(lines, "## Pages with local edits (NOT overwritten)")
+        table.insert(lines, "")
+        for _, s in ipairs(kept) do table.insert(lines, "- " .. s) end
+        table.insert(lines, "")
+      end
+      if #written > 0 then
+        table.insert(lines, "## Pages written")
+        table.insert(lines, "")
+        for _, s in ipairs(written) do table.insert(lines, "- " .. s) end
+        table.insert(lines, "")
+      end
+      space.writePage("Mikiedi/Pull", table.concat(lines, "\n"))
+      editor.flashNotification("Mikiedi: pulled " .. #written .. " new, " .. #same .. " identical, " .. #kept .. " kept local. Report: Mikiedi/Pull")
+    end)
+    if not ok then editor.alert("Mikiedi error: " .. tostring(err)) end
+  end,
+}
+
+command.define {
+  name = "Mikiedi: Delete page from Cadet",
+  run = function()
+    local ok, err = pcall(function()
+      local name = editor.getCurrentPage()
+      if mikiedi.is_excluded(name) then
+        editor.alert("Mikiedi: library/config pages are not part of the bridge.")
+        return
+      end
+      local valid, why = mikiedi.check_slug(name)
+      if not valid then
+        editor.alert(why)
+        return
+      end
+      if not editor.confirm("DELETE '" .. name .. "' from Cadet memory?\n\nThis is guarded: it only goes through if Cadet's page still matches what the bridge last saw, and the previous version is snapshotted on the Cadet side before deletion. The SilverBullet copy is asked about separately.", { destructive = true }) then
+        return
+      end
+      local pageResp = mikiedi.call({ op = "page", slug = name })
+      local hash = pageResp.result.hash
+      if hash == nil then
+        if editor.confirm("This page does not exist in Cadet memory. Delete the SilverBullet copy?", { destructive = true }) then
+          space.deletePage(name)
+          editor.flashNotification("Mikiedi: local copy deleted (nothing existed in Cadet).")
+        end
+        return
+      end
+      local payload = { op = "delete", slug = name, baseHash = hash }
+      local rf = mikiedi.refresh_flag()
+      if rf ~= nil then payload.refresh = rf end
+      local resp = mikiedi.call(payload)
+      local r = resp.result.pages[1]
+      if r.status == "deleted" then
+        editor.flashNotification("Mikiedi: '" .. name .. "' deleted from Cadet memory." .. mikiedi.describe_refresh(resp.result.refresh))
+        if editor.confirm("Also delete the SilverBullet copy of '" .. name .. "'?", { destructive = true }) then
+          space.deletePage(name)
+        end
+      elseif r.status == "conflict" then
+        local pr = mikiedi.call({ op = "page", slug = name })
+        r.cadetContent = pr.result.content
+        local cp = mikiedi.conflict_page(name, r, editor.getText())
+        editor.alert("Mikiedi: Cadet's copy changed since the bridge last saw it — deletion refused, nothing was deleted. Conflict page: " .. cp)
+      else
+        editor.alert("Mikiedi delete result: " .. r.status .. " — " .. tostring(r.detail))
+      end
+    end)
+    if not ok then editor.alert("Mikiedi error: " .. tostring(err)) end
+  end,
+}
+
+command.define {
+  name = "Mikiedi: Resolve conflict",
+  run = function()
+    local ok, err = pcall(function()
+      local status = mikiedi.call({ op = "status" }).result
+      local conflicts = status.conflicts or {}
+      if #conflicts == 0 then
+        editor.flashNotification("Mikiedi: no unresolved conflicts.")
+        return
+      end
+      local current = editor.getCurrentPage()
+      local slug = current:match("^Mikiedi/Conflicts/(.+)$")
+      if slug == nil then
+        if #conflicts == 1 then
+          slug = conflicts[1].slug
+        else
+          local options = {}
+          for _, c in ipairs(conflicts) do
+            table.insert(options, { name = c.slug, value = c.slug })
+          end
+          local picked = editor.filterBox("Resolve which conflict?", options, "Unresolved conflicts recorded by the bridge")
+          if picked == nil then return end
+          slug = picked.value
+        end
+      end
+      local known = false
+      for _, c in ipairs(conflicts) do
+        if c.slug == slug then known = true end
+      end
+      if not known then
+        editor.alert("Mikiedi: no unresolved conflict recorded for '" .. slug .. "'.")
+        return
+      end
+      local picked = editor.filterBox("Resolve '" .. slug .. "':", {
+        { name = "Keep Cadet's version (discard this space's copy)", value = "keep-cadet" },
+        { name = "Publish this space's version (overwrite Cadet)", value = "publish-sb" },
+      }, "The other version is preserved in the conflict page either way")
+      if picked == nil then return end
+      local payload = { op = "resolve", slug = slug, action = picked.value }
+      if picked.value == "publish-sb" then
+        local okr, sbText = pcall(space.readPage, slug)
+        if not okr or type(sbText) ~= "string" then
+          editor.alert("Mikiedi: no SilverBullet copy of '" .. slug .. "' found to publish.")
+          return
+        end
+        payload.content = sbText
+      end
+      local rf = mikiedi.refresh_flag()
+      if rf ~= nil then payload.refresh = rf end
+      local resp = mikiedi.call(payload)
+      local r = resp.result.pages[1]
+      if r.status ~= "resolved" then
+        editor.alert("Mikiedi: resolve returned '" .. tostring(r.status) .. "': " .. tostring(r.detail))
+        return
+      end
+      if picked.value == "keep-cadet" then
+        local pr = mikiedi.call({ op = "page", slug = slug })
+        if pr.result.content ~= nil then
+          space.writePage(slug, pr.result.content)
+        end
+        editor.flashNotification("Mikiedi: kept Cadet's version of '" .. slug .. "' and updated the local copy." .. mikiedi.describe_refresh(resp.result.refresh))
+      else
+        editor.flashNotification("Mikiedi: published this space's version of '" .. slug .. "'." .. mikiedi.describe_refresh(resp.result.refresh))
+      end
+      pcall(space.deletePage, "Mikiedi/Conflicts/" .. slug)
     end)
     if not ok then editor.alert("Mikiedi error: " .. tostring(err)) end
   end,

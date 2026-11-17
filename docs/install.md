@@ -64,8 +64,9 @@ Run **Mikiedi: Adopt Cadet state** once. It records a baseline for every existin
 1. Create a page named `mikiedi-test-page` in SilverBullet, type a sentence, run **Mikiedi: Publish current page**, accept the frontmatter scaffold if offered.
 2. Expected: "Published mikiedi-test-page to Cadet memory."
 3. On the Cadet box: the file exists under `memory/concepts/`; `Mikiedi: Status` shows the page and a journal line.
-4. Edit it, publish again; then edit the file directly on disk (simulating a Cadet-side change) and publish again → expect a **conflict** and a conflict page in `Mikiedi/Conflicts/…`. Resolve with **Mikiedi: Refresh from Cadet**.
-5. Delete the test page via the bridge `delete` op (or ask the assistant), then run **Mikiedi: Refresh from Cadet** on the SB copy → expect `deleted-in-cadet`.
+4. Edit it, publish again; then edit the file directly on disk (simulating a Cadet-side change) and publish again → expect a **conflict** and a conflict page in `Mikiedi/Conflicts/…`. Resolve with **Mikiedi: Resolve conflict** (keep either side).
+5. Delete the test page with **Mikiedi: Delete page from Cadet** (CAS-guarded, confirmations built in), then run **Mikiedi: Refresh from Cadet** on the SB copy → expect `deleted-in-cadet`.
+6. Run **Mikiedi: Pull all pages from Cadet** to import the rest of the memory store into the space.
 
 ## Uninstall / upgrade
 

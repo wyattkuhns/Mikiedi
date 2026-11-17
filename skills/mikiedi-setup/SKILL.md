@@ -55,10 +55,14 @@ the repo README and `docs/architecture.md`.
    same path (or install via the Library mechanism), then run **System: Reload**
    (Ctrl-Alt-r) in SilverBullet.
 
-6. **Configure the library.** In SilverBullet: Configuration → Mikiedi:
-   - `Bridge URL`: the full public bridge URL, e.g.
-     `https://your-assistant.example.com/webhooks/plugins/mikiedi/bridge`
-   - `Bridge token`: the same value stored in step 2.
+6. **Configure the library.** Create a `Mikiedi/Settings` page in the space with two
+   lines — `bridgeUrl:` (the full public bridge URL, e.g.
+   `https://your-assistant.example.com/webhooks/plugins/mikiedi/bridge`) and
+   `bridgeToken:` (the same value stored in step 2). On SB builds that have a
+   Configuration Manager, the same values can be set under Configuration → Mikiedi
+   instead; the settings page always wins when filled in. (The Configuration
+   Manager API postdates some deployed builds — a pinned 2.12.0-edge image has
+   no Configuration Manager at all, which is why the page is the universal path.)
 
 7. **Verify on a disposable page.**
    - In SilverBullet, create a page named like `mikiedi-test-page` with a

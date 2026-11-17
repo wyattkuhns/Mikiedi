@@ -7,7 +7,14 @@ description: Mikiedi (Memory Wiki Editor) — publish, sync, and manage Cadet me
 
 Mikiedi connects this SilverBullet space to a Cadet assistant's memory store through the Mikiedi bridge plugin (installed on the Cadet side). Pages published from here are validated, revision-guarded (CAS), snapshotted, and journaled before they reach Cadet memory; conflicts are preserved, never auto-resolved.
 
-Configure under **Configuration → Mikiedi**: `Bridge URL` (the full bridge ingress URL, e.g. `https://your-assistant.example.com/webhooks/plugins/mikiedi/bridge`) and `Bridge token` (the bearer token created during plugin setup).
+**Settings** live in the `Mikiedi/Settings` page — two lines:
+
+```
+bridgeUrl: https://your-assistant.example.com/webhooks/plugins/mikiedi/bridge
+bridgeToken: the-token-from-plugin-setup
+```
+
+On newer SilverBullet builds these same values can alternatively be set in the Configuration Manager (Mikiedi category); the settings page always wins when its values are filled in.
 
 Commands (command palette):
 
@@ -19,7 +26,7 @@ Commands (command palette):
 | `Mikiedi: Status` | Write a `Mikiedi/Status` page: sync state, conflicts, refresh state |
 | `Mikiedi: Adopt Cadet state` | Record baselines for pages that already exist in Cadet memory |
 
-Library pages (`Library/…`), the `CONFIG` page, and `Mikiedi/…` pages are never published.
+Library pages (`Library/…`), the `CONFIG` page, `Mikiedi/Settings`, and other `Mikiedi/…` pages are never published.
 
 ```space-lua
 -- priority: 40
@@ -27,34 +34,42 @@ Library pages (`Library/…`), the `CONFIG` page, and `Mikiedi/…` pages are ne
 -- memory through the bridge plugin's ingress route. See the repo README
 -- for the full conflict model and recovery guide.
 
-config.defineCategory {
-  name = "Mikiedi",
-  description = "Memory Wiki Editor bridge settings.",
-  priority = 25,
-}
-
-config.define("mikiedi.bridgeUrl", {
-  type = "string",
-  default = "",
-  ui = {
-    category = "Mikiedi",
-    label = "Bridge URL",
-    priority = 10,
-    description = "Full URL of the bridge ingress route, e.g. https://your-assistant.example.com/webhooks/plugins/mikiedi/bridge",
-  },
-})
-
-config.define("mikiedi.bridgeToken", {
-  type = "string",
-  default = "",
-  ui = {
-    category = "Mikiedi",
-    label = "Bridge token",
-    priority = 9,
-    inputType = "password",
-    description = "Bearer token stored on the Cadet side (field bridge_token, service mikiedi). Anyone who can edit this space could read it — that is the same trust level as publishing.",
-  },
-})
+-- Schema registration is best-effort: the Configuration Manager UI and its
+-- config.define* API postdate some deployed SB builds (paid 2026-11-17:
+-- a pinned 2.12.0-edge build has no Configuration Manager at all). The
+-- settings page below is the universal path.
+pcall(function()
+  if type(config.defineCategory) == "function" then
+    config.defineCategory {
+      name = "Mikiedi",
+      description = "Memory Wiki Editor bridge settings.",
+      priority = 25,
+    }
+  end
+  if type(config.define) == "function" then
+    config.define("mikiedi.bridgeUrl", {
+      type = "string",
+      default = "",
+      ui = {
+        category = "Mikiedi",
+        label = "Bridge URL",
+        priority = 10,
+        description = "Full URL of the bridge ingress route. The Mikiedi/Settings page also works on every build.",
+      },
+    })
+    config.define("mikiedi.bridgeToken", {
+      type = "string",
+      default = "",
+      ui = {
+        category = "Mikiedi",
+        label = "Bridge token",
+        priority = 9,
+        inputType = "password",
+        description = "Bearer token stored on the Cadet side (field bridge_token, service mikiedi). Anyone who can edit this space could read it — that is the same trust level as publishing.",
+      },
+    })
+  end
+end)
 
 local mikiedi = {}
 
@@ -85,13 +100,29 @@ mikiedi.check_slug = function(slug)
   return true
 end
 
-mikiedi.call = function(payload)
-  local url = config.get("mikiedi.bridgeUrl", "")
+mikiedi.settings = function()
+  local url, token = "", ""
+  local ok1, u = pcall(config.get, "mikiedi.bridgeUrl", "")
+  if ok1 and type(u) == "string" then url = u end
+  local ok2, t = pcall(config.get, "mikiedi.bridgeToken", "")
+  if ok2 and type(t) == "string" then token = t end
   if url == "" then
-    error("Mikiedi: bridge URL is not set — open Configuration and fill in the Mikiedi section")
+    -- Universal fallback: the Mikiedi/Settings page, two "key: value" lines.
+    local ok, text = pcall(space.readPage, "Mikiedi/Settings")
+    if ok and type(text) == "string" then
+      url = text:match("bridgeUrl%s*:%s*(%S+)") or ""
+      token = text:match("bridgeToken%s*:%s*(%S+)") or ""
+    end
+  end
+  return url, token
+end
+
+mikiedi.call = function(payload)
+  local url, token = mikiedi.settings()
+  if url == "" then
+    error("Mikiedi: bridge URL is not set — fill in Mikiedi/Settings (bridgeUrl line)")
   end
   local headers = { ["Content-Type"] = "application/json" }
-  local token = config.get("mikiedi.bridgeToken", "")
   if token ~= "" then
     headers["Authorization"] = "Bearer " .. token
   end

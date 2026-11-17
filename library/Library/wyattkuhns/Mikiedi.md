@@ -7,14 +7,16 @@ description: Mikiedi (Memory Wiki Editor) — publish, sync, and manage Cadet me
 
 Mikiedi connects this SilverBullet space to a Cadet assistant's memory store through the Mikiedi bridge plugin (installed on the Cadet side). Pages published from here are validated, revision-guarded (CAS), snapshotted, and journaled before they reach Cadet memory; conflicts are preserved, never auto-resolved.
 
-**Settings** live in the `Mikiedi/Settings` page — two lines:
+**Settings** live in the Workbench → **Configuration** tab, under the **Mikiedi** category (Bridge URL + Bridge token). They are saved to `Library/Config` and survive reloads.
+
+If your SilverBullet build has no Mikiedi category there, create a `Mikiedi/Settings` page with two lines instead:
 
 ```
 bridgeUrl: https://your-assistant.example.com/webhooks/plugins/mikiedi/bridge
 bridgeToken: the-token-from-plugin-setup
 ```
 
-On newer SilverBullet builds these same values can alternatively be set in the Configuration Manager (Mikiedi category); the settings page always wins when its values are filled in.
+When both are set, the Configuration values win — the settings page is only read when the Configuration entries are empty.
 
 Commands (command palette):
 
@@ -34,10 +36,9 @@ Library pages (`Library/…`), the `CONFIG` page, `Mikiedi/Settings`, and other 
 -- memory through the bridge plugin's ingress route. See the repo README
 -- for the full conflict model and recovery guide.
 
--- Schema registration is best-effort: the Configuration Manager UI and its
--- config.define* API postdate some deployed SB builds (paid 2026-11-17:
--- a pinned 2.12.0-edge build has no Configuration Manager at all). The
--- settings page below is the universal path.
+-- Schema registration is best-effort: config.define* are pcall-guarded so the
+-- library still loads on SB builds without the configuration schema API.
+-- The settings page below is the fallback path for those builds.
 pcall(function()
   if type(config.defineCategory) == "function" then
     config.defineCategory {
@@ -54,7 +55,7 @@ pcall(function()
         category = "Mikiedi",
         label = "Bridge URL",
         priority = 10,
-        description = "Full URL of the bridge ingress route. The Mikiedi/Settings page also works on every build.",
+        description = "Full URL of the bridge ingress route. A Mikiedi/Settings page is read as a fallback when this is empty.",
       },
     })
     config.define("mikiedi.bridgeToken", {
@@ -120,7 +121,7 @@ end
 mikiedi.call = function(payload)
   local url, token = mikiedi.settings()
   if url == "" then
-    error("Mikiedi: bridge URL is not set — fill in Mikiedi/Settings (bridgeUrl line)")
+    error("Mikiedi: bridge URL is not set — open Workbench → Configuration → Mikiedi and fill in Bridge URL (or set bridgeUrl in the Mikiedi/Settings page)")
   end
   local headers = { ["Content-Type"] = "application/json" }
   if token ~= "" then

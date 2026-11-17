@@ -86,6 +86,14 @@ it returns `adopt-required` instead of writing.
 
 - **Public URL 404s** → ingress not approved yet (step 3), secret missing
   (step 2), or the plugin is disabled.
+- **409 "Webhook secret not configured"** → the gateway process cannot see the
+  credential. The gateway reads its own encrypted store
+  (`$GATEWAY_SECURITY_DIR/keys.enc` + `store.key`, v2 AES-256-GCM), while
+  `assistant credentials set` writes the CES store — on self-hosted installs
+  where the gateway has no `CES_CREDENTIAL_URL`, the credential must ALSO be
+  present in the gateway store (this deployment needed exactly that shim,
+  2026-11-17). Verify with a status probe: a wrong token must 403 and the
+  right one 200.
 - **401 from the bridge** → token mismatch: the value in SilverBullet must
   equal the credential `mikiedi/bridge_token` exactly.
 - **`adopt-required` on every publish** → expected before the first adopt.

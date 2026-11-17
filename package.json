@@ -1,0 +1,13 @@
+{
+  "name": "mikiedi",
+  "version": "0.1.0",
+  "description": "Mikiedi (Memory Wiki Editor): a validated, revision-guarded bridge that publishes SilverBullet pages into Cadet memory.",
+  "displayName": "Mikiedi",
+  "icon": "book-open",
+  "license": "Apache-2.0",
+  "repository": "github:wyattkuhns/Mikiedi",
+  "keywords": ["memory", "silverbullet", "wiki", "bridge"],
+  "peerDependencies": {
+    "@mycadet/plugin-api": "^0.13.0"
+  }
+}

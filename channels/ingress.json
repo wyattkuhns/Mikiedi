@@ -1,0 +1,13 @@
+{
+  "routes": [
+    {
+      "path": "bridge",
+      "kind": "http",
+      "description": "Mikiedi memory bridge: validated, revision-guarded publication of SilverBullet pages into Cadet memory",
+      "verification": {
+        "kind": "bearer",
+        "secret": { "field": "bridge_token" }
+      }
+    }
+  ]
+}

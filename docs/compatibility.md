@@ -14,3 +14,5 @@
 - **`@mycadet/plugin-api` vs `@cadetai/plugin-api`:** the public docs use the `@cadetai` name; the installed 0.13.0 runtime enforces `@mycadet/plugin-api` as the peer dependency. This repo declares the runtime-checked name (that is what the loader verifies) and the code never imports the package — it uses the documented environment variable for workspace resolution — so the docs/runtime naming gap cannot break the plugin.
 - **Host layouts:** tested pattern is Cadet self-hosted on Linux with SilverBullet on the same host or reachable over HTTPS. Cadet Cloud hosting is untested (plugin ingress availability there is a platform question).
 - **Body size limits:** the gateway enforces request-body limits; publish one page per request (the default flow does) rather than batching a whole space.
+
+See also [security.md](security.md) for the trust model and token handling.

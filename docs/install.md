@@ -44,16 +44,9 @@ Defaults: `conceptsDir` = `<workspace>/memory/concepts`, `cliPath` = `assistant`
 
 Copy `library/Library/wyattkuhns/Mikiedi.md` from the repo into the space at the same path (or install it via SilverBullet's Library mechanism from the repo URL). The `name` frontmatter key must match the page's full path — if you place it under a different owner directory, update that key.
 
-Then run **System: Reload** (Ctrl-Alt-r) so the Space Lua definitions load, and configure the bridge. Two paths, both supported:
+Then run **System: Reload** (Ctrl-Alt-r) so the Space Lua definitions load, and configure the bridge:
 
-- **Primary (any recent SilverBullet):** **Workbench → Configuration → Mikiedi** — fill Bridge URL and Bridge token, then **Save and apply**. Values are saved to `Library/Config` and win over the fallback below.
-- **Fallback (builds without the Mikiedi configuration category):** create a `Mikiedi/Settings` page with two lines:
-  ```
-  bridgeUrl: https://your-assistant.example.com/webhooks/plugins/mikiedi/bridge
-  bridgeToken: the-value-stored-in-step-1
-  ```
-
-The Configuration values win when both are set; the settings page is only read when the Configuration entries are empty. Whoever can edit the space can read the token (it is the editor's own credential); that is the intended trust boundary.
+**Workbench → Configuration → Mikiedi** — fill Bridge URL and Bridge token, then **Save and apply**. Values are saved to `Library/Config` and survive reloads. The Configuration tab is the standard settings surface in SilverBullet going forward, and the only one Mikiedi reads — there is no settings-page fallback. Whoever can edit the space can read the token (it is the editor's own credential); that is the intended trust boundary.
 
 ## 3. First contact: adopt
 

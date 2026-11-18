@@ -9,15 +9,6 @@ Mikiedi connects this SilverBullet space to a Cadet assistant's memory store thr
 
 **Settings** live in the Workbench → **Configuration** tab, under the **Mikiedi** category (Bridge URL + Bridge token). They are saved to `Library/Config` and survive reloads.
 
-If your SilverBullet build has no Mikiedi category there, create a `Mikiedi/Settings` page with two lines instead:
-
-```
-bridgeUrl: https://your-assistant.example.com/webhooks/plugins/mikiedi/bridge
-bridgeToken: the-token-from-plugin-setup
-```
-
-When both are set, the Configuration values win — the settings page is only read when the Configuration entries are empty.
-
 Commands (command palette):
 
 | Command | What it does |
@@ -31,7 +22,7 @@ Commands (command palette):
 | `Mikiedi: Status` | Write a `Mikiedi/Status` page: sync state, conflicts, refresh state |
 | `Mikiedi: Adopt Cadet state` | Record baselines for pages that already exist in Cadet memory |
 
-Library pages (`Library/…`), the `CONFIG` page, `Mikiedi/Settings`, and other `Mikiedi/…` pages are never published.
+Library pages (`Library/…`), the `CONFIG` page, and other `Mikiedi/…` pages are never published.
 
 ```space-lua
 -- priority: 40
@@ -41,7 +32,6 @@ Library pages (`Library/…`), the `CONFIG` page, `Mikiedi/Settings`, and other 
 
 -- Schema registration is best-effort: config.define* are pcall-guarded so the
 -- library still loads on SB builds without the configuration schema API.
--- The settings page below is the fallback path for those builds.
 pcall(function()
   if type(config.defineCategory) == "function" then
     config.defineCategory {
@@ -58,7 +48,7 @@ pcall(function()
         category = "Mikiedi",
         label = "Bridge URL",
         priority = 10,
-        description = "Full URL of the bridge ingress route. A Mikiedi/Settings page is read as a fallback when this is empty.",
+        description = "Full URL of the bridge ingress route.",
       },
     })
     config.define("mikiedi.bridgeToken", {
@@ -130,14 +120,6 @@ mikiedi.settings = function()
   if ok1 and type(u) == "string" then url = u end
   local ok2, t = pcall(config.get, "mikiedi.bridgeToken", "")
   if ok2 and type(t) == "string" then token = t end
-  if url == "" then
-    -- Universal fallback: the Mikiedi/Settings page, two "key: value" lines.
-    local ok, text = pcall(space.readPage, "Mikiedi/Settings")
-    if ok and type(text) == "string" then
-      url = text:match("bridgeUrl%s*:%s*(%S+)") or ""
-      token = text:match("bridgeToken%s*:%s*(%S+)") or ""
-    end
-  end
   local opts = { autoRefresh = true, pullExclusions = {} }
   local okA, a = pcall(config.get, "mikiedi.autoRefresh", true)
   if okA and type(a) == "boolean" then opts.autoRefresh = a end
@@ -167,7 +149,7 @@ end
 mikiedi.call = function(payload)
   local url, token = mikiedi.settings()
   if url == "" then
-    error("Mikiedi: bridge URL is not set — open Workbench → Configuration → Mikiedi and fill in Bridge URL (or set bridgeUrl in the Mikiedi/Settings page)")
+    error("Mikiedi: bridge URL is not set — open Workbench → Configuration → Mikiedi and fill in Bridge URL, then Save and apply")
   end
   local headers = { ["Content-Type"] = "application/json" }
   if token ~= "" then

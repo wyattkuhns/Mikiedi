@@ -4,10 +4,12 @@ Every bridge operation is observable. State lives in `<workspace>/plugins/mikied
 
 | Path | Contents |
 | --- | --- |
-| `state.json` | Baselines, conflicts, tombstones, keep-cadet markers, refresh state |
+| `state.json` | Baselines, conflicts, tombstones, keep-cadet markers, refresh state, undo/redo stacks, recent-publish sessions |
 | `journal.jsonl` | Append-only audit trail; newest entry last |
+| `journal-archive.jsonl` | Journal lines moved out by log-retention pruning (never destroyed) |
 | `snapshots/<slug>/<ts>-<hash>.md` | Pre-image of every replaced or deleted page |
 | `conflicts/<slug>/<ts>/` | `silverbullet.md` + `cadet.md` + `meta.json` per conflict |
+| `versions/<slug-dir>/` | Version history: `index.json` plus the full content of every recorded state (v0.3) |
 
 ## Status vocabulary
 
@@ -16,10 +18,26 @@ Every bridge operation is observable. State lives in `<workspace>/plugins/mikied
 | `published` | Validated, CAS passed, written atomically | Nothing |
 | `adopt-required` | Page exists in Cadet, no baseline | Run Adopt (per page or all) |
 | `conflict` | Canonical ≠ baseline (or baseHash mismatch); both versions preserved | Resolve explicitly (below) |
+| `stale-editor` | Another editor session published this page within the stomp window; nothing written | Refresh from Cadet, then publish again if the edit still applies |
 | `error` | Validation failed; `issues[]` is specific | Fix the page, republish |
 | `pendingRefresh: true` | Pages written; index-refresh subprocess failed | `assistant memory v3 rebuild-index`, then `refresh` op |
 
 `Mikiedi: Status` in SilverBullet renders all of this (including the journal tail) into `Mikiedi/Status`.
+
+## Version history, undo/redo, and retention (v0.3)
+
+Every successful publish, resolve, undo, and redo records the new page state in the version store; deletes record tombstones. The first bridge write of a page also seeds its pre-bridge content, so history reaches back before the bridge. Identical republishes record nothing. Two undo/redo stacks per page (git semantics: any new edit clears redo) let `Mikiedi: Undo current page` / `Redo current page` step the Cadet copy back and forward through recent states — including restoring a deleted page. Restores are themselves recorded, journaled, and CAS-guarded.
+
+Retention is configured in SilverBullet (Workbench → Configuration → Mikiedi) and sent with each op:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| Log retention: amount + unit | 30 days | Journal lifetime; pruning MOVES expired lines to `journal-archive.jsonl` |
+| Log retention unit: forever / never | days | `forever` keeps everything; `never` stops recording new journal entries (recovery history is disabled) |
+| Version retention: amount + unit | 90 forever | Version store lifetime; pruning removes expired version content for good |
+| Version retention unit: forever / never | forever | `never` records no versions at all — undo/redo become unavailable |
+
+Units: seconds, minutes, hours, days, years (365.25-day years). `Mikiedi: Apply retention now` prunes both categories on demand; the prune op reports exactly what was archived/removed. The panel also gets a top-bar action button (book icon, via the standard `actionButtons` config), so it opens without the command palette.
 
 ## Resolving conflicts
 

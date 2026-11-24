@@ -27,6 +27,10 @@ import { runRebuildIndex, type RefreshResult } from "./refresh.ts";
 import { validateSlug, pagePath } from "./slugs.ts";
 import { loadState, saveState, ensureDataDir, emptyState, type BridgeState } from "./state.ts";
 import { readTextOrNull, writePageAtomic, snapshotPage, writeConflictArtifact, listConceptPages } from "./store.ts";
+import { OpLock } from "./lock.ts";
+import { parseRetention, applyRetention, type Retention, type PruneReport } from "./retention.ts";
+import { recordVersion, readVersionIndex, readVersionContent, findVersionByHash, type VersionEntry } from "./versions.ts";
+import { diffContents, type DiffHunk } from "./diff.ts";
 
 export interface BridgeDeps {
   config: ResolvedConfig;
@@ -35,6 +39,9 @@ export interface BridgeDeps {
   workspaceDir: string;
   refresh?: () => Promise<RefreshResult>;
   now?: () => Date;
+  /** v0.3 retention policies, attached per request from the payload. */
+  logRetention?: Retention;
+  versionRetention?: Retention;
 }
 
 export interface StagedPage {
@@ -46,7 +53,7 @@ export interface StagedPage {
 
 export interface PageOpResult {
   slug: string;
-  status: "published" | "conflict" | "adopt-required" | "deleted" | "resolved" | "unchanged" | "missing" | "error";
+  status: "published" | "conflict" | "adopt-required" | "deleted" | "resolved" | "unchanged" | "missing" | "error" | "stale-editor";
   issues?: string[];
   warnings?: string[];
   cadetHash?: string | null;
@@ -54,6 +61,9 @@ export interface PageOpResult {
   artifactDir?: string;
   cadetContent?: string;
   detail?: string;
+  /** Undo/redo availability after the op (panel UI). */
+  undoCount?: number;
+  redoCount?: number;
 }
 
 export interface StatusReport {
@@ -90,10 +100,180 @@ function withMutex<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-const PLUGIN_VERSION = "0.2.0";
+const PLUGIN_VERSION = "0.3.0";
 
 function iso(deps: BridgeDeps): string {
   return (deps.now ?? (() => new Date()))().toISOString();
+}
+
+/** Log-retention policy for this request (payload `retention.log`). */
+function logPolicy(deps: BridgeDeps): Retention {
+  return deps.logRetention ?? { kind: "forever" };
+}
+
+/** Writes a journal entry unless log retention is "never". */
+function journal(deps: BridgeDeps, entry: Parameters<typeof appendJournal>[1]): void {
+  appendJournal(deps.dataDir, entry, { disabled: logPolicy(deps).kind === "never" });
+}
+
+const STOMP_WINDOW_MS = 90_000; // default multi-tab advisory window
+
+/**
+ * Multi-session stomp guard: another editor session published this slug
+ * very recently and this publish comes from a different session with
+ * different content. Return an advisory verdict instead of writing or
+ * recording a conflict — the stale editor should Refresh first. Same
+ * session (the same tab) and identical content pass straight through.
+ */
+function stompCheck(
+  deps: BridgeDeps,
+  state: BridgeState,
+  slug: string,
+  sbHash: string,
+  session: string | undefined,
+  now: string,
+): PageOpResult | null {
+  if (!session) return null; // callers without a session id skip the guard
+  const rec = state.recentPublishes[slug];
+  if (!rec || rec.sessionId === session) return null;
+  const prevTs = Date.parse(rec.at);
+  const nowTs = Date.parse(now);
+  if (!Number.isFinite(prevTs) || !Number.isFinite(nowTs)) return null;
+  if (nowTs - prevTs > STOMP_WINDOW_MS) return null;
+  if (rec.hash === sbHash) return null; // identical content; idempotent
+  return {
+    slug,
+    status: "stale-editor",
+    cadetHash: rec.hash,
+    sbHash,
+    detail:
+      `This page was published from another editor session ${(nowTs - prevTs) / 1000}s ago (likely another ` +
+      "SilverBullet tab). Refresh from Cadet (Mikiedi: Refresh from Cadet) to load that version, then publish " +
+      "again if your edit still applies. Nothing was written or overwritten.",
+  };
+}
+
+/**
+ * CAS window narrowing: re-read and re-hash the canonical file immediately
+ * before the atomic write. A Cadet-side writer (native ingest, direct file
+ * edits) that lands between the op's initial check and this point aborts
+ * the write as a conflict instead of silently clobbering.
+ */
+function reVerify(deps: BridgeDeps, slug: string, expectedHash: string | null): { ok: boolean; content: string | null } {
+  const current = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+  const currentHash = current === null ? null : sha256Hex(current);
+  return { ok: currentHash === expectedHash, content: current };
+}
+
+/** Records the previous state on the undo stack; any new edit clears redo. */
+function pushUndo(
+  state: BridgeState,
+  slug: string,
+  prevHash: string | null,
+  ts: string,
+  op: string,
+): void {
+  const stack = state.undoStacks[slug] ?? (state.undoStacks[slug] = []);
+  stack.push({ hash: prevHash, ts, op });
+  if (stack.length > 100) stack.splice(0, stack.length - 100);
+  state.redoStacks[slug] = [];
+}
+
+/** Seeds the version chain with the pre-bridge content so diffs can reach
+ * back before the bridge's first write of a page. */
+function seedPreImage(deps: BridgeDeps, slug: string, canonical: string | null, now: string): void {
+  if (canonical === null) return;
+  if (readVersionIndex(deps.dataDir, slug).length === 0) {
+    recordVersion(deps.dataDir, slug, canonical, { ts: now, op: "pre-existing", outcome: "seeded" });
+  }
+}
+
+function stackCounts(state: BridgeState, slug: string): { undoCount: number; redoCount: number } {
+  return { undoCount: (state.undoStacks[slug] ?? []).length, redoCount: (state.redoStacks[slug] ?? []).length };
+}
+
+/**
+ * Restores a slug to a recorded state (hash or tombstone). Used by undo and
+ * redo. Content comes from the version store; CAS semantics apply (the
+ * restore itself is a state change and is journalled + version-recorded).
+ */
+function restoreState(
+  deps: BridgeDeps,
+  state: BridgeState,
+  slug: string,
+  target: { hash: string | null; ts: string; op: string },
+  label: "undo" | "redo",
+  session: string | undefined,
+): PageOpResult {
+  const now = iso(deps);
+  const canonical = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+  const canonicalHash = canonical === null ? null : sha256Hex(canonical);
+  if (canonicalHash === target.hash) {
+    return { slug, status: "unchanged", detail: `${label}: page is already in the target state.` };
+  }
+
+  let content: string | null = null;
+  if (target.hash !== null) {
+    const entry = findVersionByHash(deps.dataDir, slug, target.hash);
+    content = entry ? readVersionContent(deps.dataDir, slug, entry) : null;
+    if (content === null) {
+      return {
+        slug,
+        status: "error",
+        issues: [
+          `${label}: no stored content for ${shortHash(target.hash)} in the version store ` +
+            "(pruned by version retention, or recorded by an older version).",
+        ],
+      };
+    }
+  }
+
+  const recheck = reVerify(deps, slug, canonicalHash);
+  if (!recheck.ok) {
+    journal(deps, {
+      at: now,
+      op: label,
+      slug,
+      outcome: "conflict",
+      prevHash: canonicalHash,
+      detail: "canonical changed between check and restore (external writer); nothing written",
+    });
+    return {
+      slug,
+      status: "conflict",
+      cadetHash: sha256Hex(recheck.content ?? ""),
+      detail: "The page changed on the Cadet side between check and restore (external writer). Nothing was written.",
+    };
+  }
+
+  if (target.hash === null) {
+    unlinkSync(pagePath(deps.config.conceptsDir, slug));
+    state.deleted[slug] = { at: now, hash: canonicalHash! };
+    delete state.baselines[slug];
+  } else {
+    writePageAtomic(deps.config.conceptsDir, slug, content!);
+    state.baselines[slug] = { hash: target.hash, at: now };
+    delete state.deleted[slug];
+    // Restoring exactly the kept version demonstrably satisfies keep-cadet.
+    if (state.resolvedKeep[slug] && target.hash === state.resolvedKeep[slug].hash) delete state.resolvedKeep[slug];
+  }
+
+  recordVersion(deps.dataDir, slug, target.hash === null ? null : content, {
+    ts: now,
+    op: label,
+    outcome: "restored",
+    sessionId: session,
+  });
+  journal(deps, {
+    at: now,
+    op: label,
+    slug,
+    outcome: "restored",
+    prevHash: canonicalHash,
+    newHash: target.hash,
+    detail: `${label}: restored state from ${target.ts} (${target.op})`,
+  });
+  return { slug, status: target.hash === null ? "deleted" : "published", cadetHash: target.hash, detail: `${label}: restored the state from ${target.ts}.` };
 }
 
 function slugError(slug: unknown): PageOpResult | null {
@@ -130,6 +310,7 @@ async function publishOne(
   state: BridgeState,
   page: StagedPage,
   note: string | undefined,
+  session: string | undefined,
 ): Promise<PageOpResult> {
   const slugErr = slugError(page.slug);
   if (slugErr) return slugErr;
@@ -179,6 +360,8 @@ async function publishOne(
         ],
       };
     }
+    const stomp = stompCheck(deps, state, slug, sbHash, session, now);
+    if (stomp) return stomp;
     const stale =
       canonicalHash !== baseline.hash || (page.baseHash !== undefined && page.baseHash !== canonicalHash);
     if (stale) {
@@ -195,7 +378,7 @@ async function publishOne(
         cadetHash: canonicalHash,
         artifactDir: artifact.artifactDir,
       };
-      appendJournal(deps.dataDir, {
+      journal(deps, {
         at: now,
         op: "publish",
         slug,
@@ -227,6 +410,31 @@ async function publishOne(
     };
   }
 
+  // CAS window closed: the write only lands if the canonical file is still
+  // byte-identical to what this op checked moments ago.
+  const recheck = reVerify(deps, slug, canonicalHash);
+  if (!recheck.ok) {
+    const racedHash = sha256Hex(recheck.content ?? "");
+    journal(deps, {
+      at: now,
+      op: "publish",
+      slug,
+      outcome: "conflict",
+      prevHash: racedHash,
+      detail: `canonical changed between check and write (${shortHash(canonicalHash)} -> ${shortHash(racedHash)}); nothing written`,
+    });
+    return {
+      slug,
+      status: "conflict",
+      cadetHash: racedHash,
+      sbHash,
+      detail:
+        "The page changed on the Cadet side between this op's check and its write (an external writer). " +
+        "Nothing was written; run the op again to reconcile against the new content.",
+    };
+  }
+
+  const identical = canonicalHash === sha256Hex(content);
   if (canonical !== null) {
     snapshotPage(deps.dataDir, slug, canonical, canonicalHash!, now);
   }
@@ -238,19 +446,43 @@ async function publishOne(
   // editor demonstrably has the kept version in hand.
   if (canonicalHash !== null && newHash === canonicalHash) delete state.resolvedKeep[slug];
   if (canonicalHash === null) delete state.resolvedKeep[slug];
-  appendJournal(deps.dataDir, {
-    at: now,
-    op: "publish",
+
+  if (identical) {
+    journal(deps, {
+      at: now,
+      op: "publish",
+      slug,
+      outcome: "unchanged",
+      prevHash: canonicalHash,
+      newHash,
+      ...(note ? { detail: note } : {}),
+    });
+  } else {
+    seedPreImage(deps, slug, canonical, now);
+    recordVersion(deps.dataDir, slug, content, { ts: now, op: "publish", outcome: canonical === null ? "created" : "updated", sessionId: session, note });
+    pushUndo(state, slug, canonicalHash, now, "publish");
+    journal(deps, {
+      at: now,
+      op: "publish",
+      slug,
+      outcome: canonical === null ? "created" : "updated",
+      prevHash: canonicalHash,
+      newHash,
+      ...(note ? { detail: note } : {}),
+    });
+  }
+  state.recentPublishes[slug] = { at: now, hash: newHash, sessionId: session ?? "" };
+  return {
     slug,
-    outcome: canonical === null ? "created" : "updated",
-    prevHash: canonicalHash,
-    newHash,
-    ...(note ? { detail: note } : {}),
-  });
-  return { slug, status: "published", cadetHash: newHash, sbHash, warnings: validated(deps, slug, content)?.warnings };
+    status: "published",
+    cadetHash: newHash,
+    sbHash,
+    warnings: validated(deps, slug, content)?.warnings,
+    ...stackCounts(state, slug),
+  };
 }
 
-function deleteOne(deps: BridgeDeps, state: BridgeState, slug: string, baseHash: string | undefined, note?: string): PageOpResult {
+function deleteOne(deps: BridgeDeps, state: BridgeState, slug: string, baseHash: string | undefined, note?: string, session?: string): PageOpResult {
   const slugErr = slugError(slug);
   if (slugErr) return slugErr;
   const now = iso(deps);
@@ -259,7 +491,7 @@ function deleteOne(deps: BridgeDeps, state: BridgeState, slug: string, baseHash:
 
   if (canonical === null) {
     const already = state.deleted[slug];
-    appendJournal(deps.dataDir, { at: now, op: "delete", slug, outcome: "already-absent" });
+    journal(deps, { at: now, op: "delete", slug, outcome: "already-absent" });
     return {
       slug,
       status: "unchanged",
@@ -270,7 +502,7 @@ function deleteOne(deps: BridgeDeps, state: BridgeState, slug: string, baseHash:
     return { slug, status: "conflict", cadetHash: canonicalHash, artifactDir: state.conflicts[slug].artifactDir, detail: "Resolve the recorded conflict first." };
   }
   if (!baseHash || baseHash !== canonicalHash) {
-    appendJournal(deps.dataDir, { at: now, op: "delete", slug, outcome: "conflict", prevHash: canonicalHash });
+    journal(deps, { at: now, op: "delete", slug, outcome: "conflict", prevHash: canonicalHash });
     return {
       slug,
       status: "conflict",
@@ -279,11 +511,30 @@ function deleteOne(deps: BridgeDeps, state: BridgeState, slug: string, baseHash:
         "Deletion requires the exact current hash of the Cadet page (CAS). Fetch the page (op 'page') and retry with its hash.",
     };
   }
+  const recheck = reVerify(deps, slug, canonicalHash);
+  if (!recheck.ok) {
+    journal(deps, {
+      at: now,
+      op: "delete",
+      slug,
+      outcome: "conflict",
+      prevHash: canonicalHash,
+      detail: "canonical changed between check and delete (external writer); nothing deleted",
+    });
+    return {
+      slug,
+      status: "conflict",
+      cadetHash: sha256Hex(recheck.content ?? ""),
+      detail: "The page changed on the Cadet side between check and delete (external writer). Nothing was deleted.",
+    };
+  }
   snapshotPage(deps.dataDir, slug, canonical, canonicalHash, now);
   unlinkSync(pagePath(deps.config.conceptsDir, slug));
   state.deleted[slug] = { at: now, hash: canonicalHash };
   delete state.baselines[slug];
-  appendJournal(deps.dataDir, {
+  recordVersion(deps.dataDir, slug, null, { ts: now, op: "delete", outcome: "deleted", sessionId: session, note });
+  pushUndo(state, slug, canonicalHash, now, "delete");
+  journal(deps, {
     at: now,
     op: "delete",
     slug,
@@ -292,7 +543,7 @@ function deleteOne(deps: BridgeDeps, state: BridgeState, slug: string, baseHash:
     newHash: null,
     ...(note ? { detail: note } : {}),
   });
-  return { slug, status: "deleted", cadetHash: null };
+  return { slug, status: "deleted", cadetHash: null, ...stackCounts(state, slug) };
 }
 
 function adoptPages(deps: BridgeDeps, state: BridgeState, slugs: string[] | "all", note?: string): PageOpResult[] {
@@ -313,7 +564,7 @@ function adoptPages(deps: BridgeDeps, state: BridgeState, slugs: string[] | "all
     }
     const hash = sha256Hex(canonical);
     state.baselines[slug] = { hash, at: now };
-    appendJournal(deps.dataDir, {
+    journal(deps, {
       at: now,
       op: "adopt",
       slug,
@@ -333,6 +584,7 @@ function resolveConflict(
   slug: string,
   action: "keep-cadet" | "publish-sb",
   content: string | undefined,
+  session?: string,
 ): PageOpResult {
   const slugErr = slugError(slug);
   if (slugErr) return slugErr;
@@ -348,7 +600,7 @@ function resolveConflict(
     if (canonicalHash !== null) state.baselines[slug] = { hash: canonicalHash, at: now };
     state.resolvedKeep[slug] = { at: now, hash: canonicalHash ?? "" };
     delete state.conflicts[slug];
-    appendJournal(deps.dataDir, {
+    journal(deps, {
       at: now,
       op: "resolve",
       slug,
@@ -357,7 +609,7 @@ function resolveConflict(
       newHash: canonicalHash,
       detail: `kept Cadet version ${shortHash(canonicalHash)}; editor should refresh`,
     });
-    return { slug, status: "resolved", cadetHash: canonicalHash, detail: "Kept the Cadet version; refresh the editor copy." };
+    return { slug, status: "resolved", cadetHash: canonicalHash, detail: "Kept the Cadet version; refresh the editor copy.", ...stackCounts(state, slug) };
   }
 
   // publish-sb: the editor version wins, explicitly, against the displayed
@@ -372,12 +624,32 @@ function resolveConflict(
   }
   const v = validatePageContent(sbContent, slug);
   if (v.issues.length > 0) return { slug, status: "error", issues: v.issues };
+  const recheck = reVerify(deps, slug, canonicalHash);
+  if (!recheck.ok) {
+    journal(deps, {
+      at: now,
+      op: "resolve",
+      slug,
+      outcome: "conflict",
+      prevHash: canonicalHash,
+      detail: "canonical changed between check and resolve (external writer); nothing written",
+    });
+    return {
+      slug,
+      status: "conflict",
+      cadetHash: sha256Hex(recheck.content ?? ""),
+      detail: "The page changed on the Cadet side between check and resolve (external writer). Nothing was written.",
+    };
+  }
   if (canonical !== null) snapshotPage(deps.dataDir, slug, canonical, canonicalHash!, now);
   writePageAtomic(deps.config.conceptsDir, slug, sbContent);
   const newHash = sha256Hex(sbContent);
   state.baselines[slug] = { hash: newHash, at: now };
   delete state.conflicts[slug];
-  appendJournal(deps.dataDir, {
+  seedPreImage(deps, slug, canonical, now);
+  recordVersion(deps.dataDir, slug, sbContent, { ts: now, op: "resolve", outcome: "publish-sb", sessionId: session });
+  pushUndo(state, slug, canonicalHash, now, "resolve");
+  journal(deps, {
     at: now,
     op: "resolve",
     slug,
@@ -386,7 +658,7 @@ function resolveConflict(
     newHash,
     detail: `editor version overrode Cadet ${shortHash(canonicalHash)} (explicit resolution)`,
   });
-  return { slug, status: "resolved", cadetHash: newHash, detail: "Editor version published as the explicit resolution." };
+  return { slug, status: "resolved", cadetHash: newHash, detail: "Editor version published as the explicit resolution.", ...stackCounts(state, slug) };
 }
 
 function syncOne(deps: BridgeDeps, state: BridgeState, slug: string, sbContent: string | undefined): SyncVerdict & { slug: string } {
@@ -452,7 +724,7 @@ function syncOne(deps: BridgeDeps, state: BridgeState, slug: string, sbContent: 
     now,
   );
   state.conflicts[slug] = { at: now, sbHash, cadetHash: canonicalHash, artifactDir: artifact.artifactDir };
-  appendJournal(deps.dataDir, {
+  journal(deps, {
     at: now,
     op: "sync",
     slug,
@@ -483,10 +755,41 @@ export interface PublishOptions {
 export async function handleOp(deps: BridgeDeps, payload: Record<string, unknown>): Promise<BridgeResponse> {
   ensureDataDir(deps.dataDir);
   const op = payload.op;
+  // v0.3: retention policies ride on the payload (composed by the SB library
+  // from its config). Absent = sensible defaults (log forever, versions forever).
+  const retentionSpec = (payload.retention ?? {}) as { log?: unknown; versions?: unknown };
+  deps.logRetention = parseRetention(retentionSpec.log, { kind: "forever" });
+  deps.versionRetention = parseRetention(retentionSpec.versions, { kind: "forever" });
+  // Cross-process lock. The in-process mutex is taken FIRST so concurrent
+  // same-process ops queue politely as before; the file lock then serializes
+  // across processes. The stale threshold exceeds the worst op duration
+  // (a held refresh subprocess can run up to refreshTimeoutMs); a genuinely
+  // alive holder is never broken, so callers queue behind it rather than fail.
+  const threshold = Math.max(deps.config.refreshTimeoutMs + 30_000, 60_000);
+  const lock = new OpLock(deps.dataDir, threshold, 25, threshold);
   try {
-    return await withMutex(() => dispatch(deps, op, payload));
+    return await withMutex(async () => {
+      await lock.acquire();
+      try {
+        return await dispatch(deps, op, payload);
+      } finally {
+        lock.release();
+      }
+    });
   } catch (e: unknown) {
-    return { ok: false, error: `Mikiedi: ${op} failed: ${(e as Error)?.message ?? String(e)}` };
+    const detail = `Mikiedi: ${op} failed: ${(e as Error)?.message ?? String(e)}`;
+    try {
+      appendJournal(deps.dataDir, {
+        at: iso(deps),
+        op: String(op ?? "unknown"),
+        slug: "",
+        outcome: "error",
+        detail,
+      });
+    } catch {
+      // journaling must never mask the real failure
+    }
+    return { ok: false, error: detail };
   }
 }
 
@@ -577,9 +880,22 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
       if (!Array.isArray(pages) || pages.length === 0) {
         return { ok: false, error: "Mikiedi: publish needs a non-empty 'pages' array of {slug, content}" };
       }
+      const session = typeof payload.session === "string" ? payload.session : undefined;
       const results: PageOpResult[] = [];
       for (const page of pages) {
-        results.push(await publishOne(deps, state, page, typeof payload.note === "string" ? payload.note : undefined));
+        results.push(await publishOne(deps, state, page, typeof payload.note === "string" ? payload.note : undefined, session));
+      }
+      // Validation and slug errors are journalled too (the log panel shows failures).
+      for (const r of results) {
+        if (r.status === "error" || r.status === "stale-editor") {
+          journal(deps, {
+            at: iso(deps),
+            op: "publish",
+            slug: r.slug,
+            outcome: r.status,
+            detail: (r.issues ?? [r.detail ?? ""]).join("; ") || undefined,
+          });
+        }
       }
       saveState(deps.dataDir, state);
       let refresh: RefreshResult | undefined;
@@ -598,6 +914,7 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
         String(payload.slug ?? ""),
         typeof payload.baseHash === "string" ? payload.baseHash : undefined,
         typeof payload.note === "string" ? payload.note : undefined,
+        typeof payload.session === "string" ? payload.session : undefined,
       );
       saveState(deps.dataDir, state);
       let refresh: RefreshResult | undefined;
@@ -634,6 +951,7 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
         String(payload.slug ?? ""),
         action,
         typeof payload.content === "string" ? payload.content : undefined,
+        typeof payload.session === "string" ? payload.session : undefined,
       );
       saveState(deps.dataDir, state);
       let refresh: RefreshResult | undefined;
@@ -664,10 +982,148 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
       return { ok: true, op: "refresh", result: refresh };
     }
 
+    case "log": {
+      const count = typeof payload.count === "number" && payload.count > 0 ? Math.min(payload.count, 500) : 50;
+      return { ok: true, op: "log", result: { entries: readJournalTail(deps.dataDir, count) } };
+    }
+
+    case "versions": {
+      const slug = String(payload.slug ?? "");
+      const slugErr = slugError(slug);
+      if (slugErr) return { ok: true, op: "versions", result: slugErr };
+      const canonical = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+      return {
+        ok: true,
+        op: "versions",
+        result: {
+          slug,
+          versions: readVersionIndex(deps.dataDir, slug),
+          currentHash: canonical === null ? null : sha256Hex(canonical),
+          ...stackCounts(state, slug),
+        },
+      };
+    }
+
+    case "diff": {
+      const slug = String(payload.slug ?? "");
+      const slugErr = slugError(slug);
+      if (slugErr) return { ok: true, op: "diff", result: slugErr };
+      const resolve = (spec: unknown): { text: string; hash: string | null; error?: string } => {
+        if (spec === "current") {
+          const text = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+          return { text: text ?? "", hash: text === null ? null : sha256Hex(text) };
+        }
+        if (typeof spec === "string") {
+          const entry = findVersionByHash(deps.dataDir, slug, spec);
+          if (!entry) return { text: "", hash: null, error: `no recorded version with hash ${shortHash(spec)}` };
+          const text = readVersionContent(deps.dataDir, slug, entry);
+          if (text === null) return { text: "", hash: null, error: `content pruned or unreadable for ${shortHash(spec)}` };
+          return { text, hash: spec };
+        }
+        return { text: "", hash: null, error: "side must be a version hash or 'current'" };
+      };
+      const a = resolve(payload.from ?? "current");
+      const b = resolve(payload.to ?? "current");
+      if (a.error || b.error) {
+        return {
+          ok: true,
+          op: "diff",
+          result: { slug, status: "error", issues: [a.error, b.error].filter(Boolean) },
+        };
+      }
+      const context = typeof payload.context === "number" ? payload.context : 3;
+      return {
+        ok: true,
+        op: "diff",
+        result: {
+          slug,
+          fromHash: a.hash,
+          toHash: b.hash,
+          hunks: diffContents(a.text, b.text, context),
+        },
+      };
+    }
+
+    case "undo": {
+      const slug = String(payload.slug ?? "");
+      const slugErr = slugError(slug);
+      if (slugErr) return { ok: true, op: "undo", result: slugErr };
+      const stack = state.undoStacks[slug] ?? [];
+      const target = stack.pop();
+      if (!target) {
+        return {
+          ok: true,
+          op: "undo",
+          result: { pages: [{ slug, status: "unchanged", detail: "Nothing to undo (no recorded previous state).", ...stackCounts(state, slug) }] },
+        };
+      }
+      // The state the restore will replace becomes the redo target.
+      const current = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+      const currentHash = current === null ? null : sha256Hex(current);
+      const result = restoreState(deps, state, slug, target, "undo", typeof payload.session === "string" ? payload.session : undefined);
+      if (result.status === "published" || result.status === "deleted") {
+        state.redoStacks[slug] = state.redoStacks[slug] ?? [];
+        state.redoStacks[slug].push({ hash: currentHash, ts: target.ts, op: "undo" });
+      } else {
+        // Nothing changed (error/conflict/unchanged): put the entry back.
+        stack.push(target);
+      }
+      saveState(deps.dataDir, state);
+      let refresh: RefreshResult | undefined;
+      if ((result.status === "published" || result.status === "deleted") && payload.refresh !== false) {
+        refresh = await doRefresh(deps, state);
+        saveState(deps.dataDir, state);
+      }
+      return { ok: true, op: "undo", result: { pages: [{ ...result, ...stackCounts(state, slug) }], ...(refresh ? { refresh } : {}) } };
+    }
+
+    case "redo": {
+      const slug = String(payload.slug ?? "");
+      const slugErr = slugError(slug);
+      if (slugErr) return { ok: true, op: "redo", result: slugErr };
+      const stack = state.redoStacks[slug] ?? [];
+      const target = stack.pop();
+      if (!target) {
+        return {
+          ok: true,
+          op: "redo",
+          result: { pages: [{ slug, status: "unchanged", detail: "Nothing to redo.", ...stackCounts(state, slug) }] },
+        };
+      }
+      const current = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+      const currentHash = current === null ? null : sha256Hex(current);
+      const result = restoreState(deps, state, slug, target, "redo", typeof payload.session === "string" ? payload.session : undefined);
+      if (result.status === "published" || result.status === "deleted") {
+        state.undoStacks[slug] = state.undoStacks[slug] ?? [];
+        state.undoStacks[slug].push({ hash: currentHash, ts: target.ts, op: "redo" });
+      } else {
+        stack.push(target);
+      }
+      saveState(deps.dataDir, state);
+      let refresh: RefreshResult | undefined;
+      if ((result.status === "published" || result.status === "deleted") && payload.refresh !== false) {
+        refresh = await doRefresh(deps, state);
+        saveState(deps.dataDir, state);
+      }
+      return { ok: true, op: "redo", result: { pages: [{ ...result, ...stackCounts(state, slug) }], ...(refresh ? { refresh } : {}) } };
+    }
+
+    case "prune": {
+      const report: PruneReport = applyRetention(deps.dataDir, deps.logRetention ?? { kind: "forever" }, deps.versionRetention ?? { kind: "forever" }, Date.parse(iso(deps)));
+      journal(deps, {
+        at: iso(deps),
+        op: "prune",
+        slug: "",
+        outcome: "pruned",
+        detail: `journal archived ${report.journalArchived} (cleared=${report.journalCleared}); versions removed ${report.versionsRemoved} across ${report.slugsTouched.length} slug(s)`,
+      });
+      return { ok: true, op: "prune", result: report };
+    }
+
     default:
       return {
         ok: false,
-        error: `Mikiedi: unknown op '${String(op)}'. Valid ops: status, pages, page, fetchAll, validate, publish, delete, adopt, resolve, sync, refresh.`,
+        error: `Mikiedi: unknown op '${String(op)}'. Valid ops: status, pages, page, fetchAll, validate, publish, delete, adopt, resolve, sync, refresh, log, versions, diff, undo, redo, prune.`,
       };
   }
 }

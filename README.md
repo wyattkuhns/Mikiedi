@@ -23,13 +23,20 @@ Nothing is mounted live, nothing is auto-merged, and no writes happen without a 
 ```
 SilverBullet page ──POST /webhooks/plugins/mikiedi/bridge──▶ gateway verifies bearer
     ▶ plugin route (routes/bridge.ts)
-    ▶ op engine (src/ops.ts):
+    ▶ op engine (src/ops.ts), under the cross-process op lock + in-process mutex:
          validate slug + conservative frontmatter check
-         CAS: canonical hash == recorded baseline (and == editor-declared baseHash)
+         CAS: canonical hash == recorded baseline (and == editor-declared baseHash);
+              canonical re-hashed immediately before the write (external-writer race aborts)
+         multi-tab guard: publish from another session inside the window → stale-editor advisory
          conflict? → preserve BOTH versions in data/conflicts/, write nothing
-         safe? → snapshot pre-image → atomic write → journal → index refresh
-    ◀ per-page result: published | adopt-required | conflict | error
+         safe? → snapshot pre-image → version recorded → atomic write → journal → index refresh
+    ◀ per-page result: published | adopt-required | conflict | stale-editor | error
 ```
+
+Version history (per-page, with undo/redo, git-style diffs in the
+SilverBullet panel) and the two retention policies (log vs versions, each
+seconds/minutes/hours/days/years or forever/never) are documented in
+[`docs/operations.md`](docs/operations.md).
 
 ## Repository layout
 

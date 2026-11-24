@@ -38,6 +38,20 @@ export interface BridgeState {
   resolvedKeep: Record<string, { at: string; hash: string }>;
   lastRefresh: { at: string; ok: boolean; detail: string } | null;
   pendingRefresh: boolean;
+  /**
+   * v0.3 multi-session guard: the most recent publish per slug, with the
+   * editor session id that made it. A publish from a DIFFERENT session
+   * inside the stomp window returns a "stale-editor" advisory (nothing is
+   * written) so two open SB tabs warn instead of silently stomping.
+   */
+  recentPublishes: Record<string, { at: string; hash: string; sessionId: string }>;
+  /**
+   * v0.3 undo/redo stacks, per slug, git semantics: states are {hash, ts, op}
+   * snapshots (hash null = the page was deleted at that point). Every state
+   * change pushes the previous state onto undoStacks and clears redoStacks.
+   */
+  undoStacks: Record<string, Array<{ hash: string | null; ts: string; op: string }>>;
+  redoStacks: Record<string, Array<{ hash: string | null; ts: string; op: string }>>;
 }
 
 export function emptyState(): BridgeState {
@@ -49,6 +63,9 @@ export function emptyState(): BridgeState {
     resolvedKeep: {},
     lastRefresh: null,
     pendingRefresh: false,
+    recentPublishes: {},
+    undoStacks: {},
+    redoStacks: {},
   };
 }
 
@@ -65,6 +82,9 @@ export function loadState(dataDir: string): BridgeState {
         resolvedKeep: parsed.resolvedKeep ?? {},
         lastRefresh: parsed.lastRefresh ?? null,
         pendingRefresh: Boolean(parsed.pendingRefresh),
+        recentPublishes: parsed.recentPublishes ?? {},
+        undoStacks: parsed.undoStacks ?? {},
+        redoStacks: parsed.redoStacks ?? {},
       };
     }
   } catch {

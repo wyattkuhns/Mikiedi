@@ -19,8 +19,15 @@ Commands (command palette):
 | `Mikiedi: Refresh from Cadet` | Pull the canonical version of this page, with conflict safety |
 | `Mikiedi: Delete page from Cadet` | CAS-guarded deletion of this page from Cadet memory, with confirmations |
 | `Mikiedi: Resolve conflict` | Keep Cadet's version or publish this space's version for a recorded conflict |
+| `Mikiedi: Show panel` | The v0.3 panel: operation log with timestamps, per-page version history, git-style diffs, undo/redo, toolbar (Config / Help / Issues / Info) — also a top-bar button (book icon) |
+| `Mikiedi: Undo current page` | Step the Cadet copy of this page back to its previous state |
+| `Mikiedi: Redo current page` | Step the Cadet copy forward again (after an undo) |
+| `Mikiedi: Apply retention now` | Prune the Cadet-side log and version history per the configured retention |
+| `Mikiedi: Open help` | Open (or create) the Mikiedi/Help page |
 | `Mikiedi: Status` | Write a `Mikiedi/Status` page: sync state, conflicts, refresh state |
 | `Mikiedi: Adopt Cadet state` | Record baselines for pages that already exist in Cadet memory |
+
+Retention (how long the Cadet side keeps the operation log vs full page versions — seconds/minutes/hours/days/years, or forever/never) is configured in Workbench → Configuration → Mikiedi. See `Mikiedi: Open help` for the full guide.
 
 Library pages (`Library/…`), the `CONFIG` page, and other `Mikiedi/…` pages are never published.
 
@@ -82,10 +89,137 @@ pcall(function()
         description = "Comma-separated slug prefixes that 'Pull all pages from Cadet' skips, e.g. 'drafts/, scratch/'. Exact slugs also match. Empty means pull everything.",
       },
     })
+    config.define("mikiedi.logRetentionAmount", {
+      type = "string",
+      default = "30",
+      ui = {
+        category = "Mikiedi",
+        label = "Log retention: amount",
+        priority = 6,
+        description = "How many units to keep the bridge operation log (journal). Used with the unit dropdown. Ignored when the unit is forever or never.",
+      },
+    })
+    config.define("mikiedi.logRetentionUnit", {
+      type = "string",
+      enum = { "seconds", "minutes", "hours", "days", "years", "forever", "never" },
+      default = "days",
+      ui = {
+        category = "Mikiedi",
+        label = "Log retention: unit",
+        priority = 6,
+        description = "Unit for the log amount. forever keeps the log indefinitely; never stops recording new log entries (existing history is kept until a prune).",
+      },
+    })
+    config.define("mikiedi.versionRetentionAmount", {
+      type = "string",
+      default = "90",
+      ui = {
+        category = "Mikiedi",
+        label = "Version retention: amount",
+        priority = 5,
+        description = "How many units to keep full page versions (the copies behind the panel's diff viewer and undo/redo). Used with the unit dropdown. Ignored when the unit is forever or never.",
+      },
+    })
+    config.define("mikiedi.versionRetentionUnit", {
+      type = "string",
+      enum = { "seconds", "minutes", "hours", "days", "years", "forever", "never" },
+      default = "forever",
+      ui = {
+        category = "Mikiedi",
+        label = "Version retention: unit",
+        priority = 5,
+        description = "Unit for the version amount. forever keeps every version (undo/redo always available); never records no versions at all, which disables undo/redo.",
+      },
+    })
+  end
+end)
+
+-- Top-bar action button so the panel is one click away, next to the
+-- standard SilverBullet menu buttons (falls back to raw config injection
+-- on builds without the Std actionButton API).
+pcall(function()
+  local spec = {
+    icon = "book-open",
+    description = "Mikiedi panel — log, versions, diffs, undo/redo",
+    command = "Mikiedi: Show panel",
+    priority = 1.5,
+    dropdown = false,
+  }
+  if type(actionButton) == "table" and type(actionButton.define) == "function" then
+    actionButton.define(spec)
+  else
+    local btns = config.get("actionButtons", {})
+    table.insert(btns, spec)
   end
 end)
 
 local mikiedi = {}
+
+-- Per-tab session id: each browser tab evaluates this library separately, so
+-- two tabs produce two distinct sessions. The bridge uses it for the
+-- multi-tab stomp guard (a publish from another session inside the window
+-- is refused with a "refresh first" advisory instead of overwriting).
+local MIKIEDI_SESSION = os.date("!%Y%m%dT%H%M%SZ") .. "-" .. tostring(math.random(100000, 999999))
+mikiedi.session = MIKIEDI_SESSION
+
+mikiedi.retention_unit_spec = function(amount, unit)
+  if unit == "forever" or unit == "never" then return unit end
+  local letters = { seconds = "s", minutes = "m", hours = "h", days = "d", years = "y" }
+  local n = tonumber(amount)
+  if n == nil or n <= 0 then n = 30 end
+  return string.format("%g%s", n, letters[unit] or "d")
+end
+
+-- Retention payload for state-changing ops, composed from the config fields.
+mikiedi.retention = function()
+  local ok1, la = pcall(config.get, "mikiedi.logRetentionAmount", "30")
+  local ok2, lu = pcall(config.get, "mikiedi.logRetentionUnit", "days")
+  local ok3, va = pcall(config.get, "mikiedi.versionRetentionAmount", "90")
+  local ok4, vu = pcall(config.get, "mikiedi.versionRetentionUnit", "forever")
+  return {
+    log = mikiedi.retention_unit_spec(ok1 and la or "30", ok2 and lu or "days"),
+    versions = mikiedi.retention_unit_spec(ok3 and va or "90", ok4 and vu or "forever"),
+  }
+end
+
+mikiedi.main_slug = function(payload)
+  if type(payload.slug) == "string" and payload.slug ~= "" then return payload.slug end
+  if type(payload.pages) == "table" and type(payload.pages[1]) == "table" then
+    return tostring(payload.pages[1].slug or "")
+  end
+  return ""
+end
+
+-- Persistent operation log page (Mikiedi/Log), newest last, capped at 200
+-- rows. The Cadet-side journal remains the authoritative log; this page is
+-- the in-space view the panel and readers use. Never published (Mikiedi/*).
+mikiedi.append_log = function(op, slug, outcome, detail)
+  local name = "Mikiedi/Log"
+  local rows = {}
+  local ok, existing = pcall(space.readPage, name)
+  if ok and type(existing) == "string" then
+    for line in existing:gmatch("[^\n]+") do
+      if line:sub(1, 2) == "| " and not line:match("^| Timestamp") and not line:match("^| %-%-%-") then
+        table.insert(rows, line)
+      end
+    end
+  end
+  local stamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  local det = tostring(detail or ""):gsub("|", "/"):gsub("[\r\n]+", " ")
+  if #det > 160 then det = det:sub(1, 157) .. "..." end
+  table.insert(rows, "| " .. stamp .. " | " .. tostring(op or "?") .. " | " .. tostring(slug or "") .. " | " .. tostring(outcome or "?") .. " | " .. det .. " |")
+  while #rows > 200 do table.remove(rows, 1) end
+  local body = {
+    "# Mikiedi log",
+    "",
+    "Recent bridge operations from this space, newest last. Maintained automatically; not published to Cadet.",
+    "",
+    "| Timestamp | Op | Slug | Outcome | Detail |",
+    "| --- | --- | --- | --- | --- |",
+  }
+  for _, r in ipairs(rows) do table.insert(body, r) end
+  space.writePage(name, table.concat(body, "\n"))
+end
 
 mikiedi.is_excluded = function(name)
   return name:match("^Library/") ~= nil
@@ -146,10 +280,18 @@ mikiedi.refresh_flag = function()
   return false -- explicit "do not refresh" for the bridge payload
 end
 
+local STATE_CHANGING_OPS = { publish = true, delete = true, resolve = true, undo = true, redo = true, prune = true }
+
 mikiedi.call = function(payload)
   local url, token = mikiedi.settings()
   if url == "" then
     error("Mikiedi: bridge URL is not set — open Workbench → Configuration → Mikiedi and fill in Bridge URL, then Save and apply")
+  end
+  -- v0.3: every call carries the per-tab session id; state-changing ops also
+  -- carry the retention policy composed from the configuration.
+  payload.session = MIKIEDI_SESSION
+  if STATE_CHANGING_OPS[payload.op] then
+    payload.retention = mikiedi.retention()
   end
   local headers = { ["Content-Type"] = "application/json" }
   if token ~= "" then
@@ -157,6 +299,7 @@ mikiedi.call = function(payload)
   end
   local resp = net.proxyFetch(url, { method = "POST", headers = headers, body = payload })
   if resp == nil then
+    pcall(mikiedi.append_log, payload.op or "?", mikiedi.main_slug(payload), "error", "the bridge returned no response")
     error("Mikiedi: the bridge returned no response")
   end
   if resp.status ~= 200 then
@@ -166,11 +309,22 @@ mikiedi.call = function(payload)
     else
       detail = tostring(resp.body)
     end
+    pcall(mikiedi.append_log, payload.op or "?", mikiedi.main_slug(payload), "error", "HTTP " .. tostring(resp.status) .. ": " .. detail)
     error("Mikiedi: bridge error (HTTP " .. tostring(resp.status) .. "): " .. detail)
   end
   if type(resp.body) == "table" and resp.body.ok == false then
+    pcall(mikiedi.append_log, payload.op or "?", mikiedi.main_slug(payload), "error", tostring(resp.body.error))
     error("Mikiedi: " .. tostring(resp.body.error))
   end
+  -- Success: record the outcome on the Mikiedi/Log page.
+  local outcome = "ok"
+  local detail = ""
+  if type(resp.body.result) == "table" and type(resp.body.result.pages) == "table" and type(resp.body.result.pages[1]) == "table" then
+    local r = resp.body.result.pages[1]
+    outcome = tostring(r.status or "ok")
+    detail = tostring(r.detail or table.concat(r.issues or {}, "; "))
+  end
+  pcall(mikiedi.append_log, payload.op or "?", mikiedi.main_slug(payload), outcome, detail)
   return resp.body
 end
 
@@ -252,6 +406,16 @@ mikiedi.publish_pages = function(entries)
         editor.flashNotification("Conflict recorded: " .. cp)
       else
         editor.flashNotification("Conflict recorded for " .. r.slug .. " — nothing was written to Cadet.", "warning")
+      end
+    elseif r.status == "stale-editor" then
+      if editor.confirm("Another editor session (likely another SilverBullet tab) published this page very recently.\n\n" .. tostring(r.detail) .. "\n\nRefresh this page from Cadet now?", { destructive = false }) then
+        local pr = mikiedi.call({ op = "page", slug = r.slug })
+        if pr.result.content ~= nil then
+          space.writePage(r.slug, pr.result.content)
+          editor.flashNotification("Mikiedi: '" .. r.slug .. "' refreshed from Cadet.")
+        end
+      else
+        editor.flashNotification("Nothing was written; your copy is unchanged locally.", "warning")
       end
     else
       editor.alert("Mikiedi publish result:\n" .. summary)
@@ -613,6 +777,384 @@ command.define {
       end
       local resp = mikiedi.call({ op = "adopt", slugs = "all" })
       editor.flashNotification("Mikiedi: adopted " .. #resp.result.pages .. " pages as baseline.")
+    end)
+    if not ok then editor.alert("Mikiedi error: " .. tostring(err)) end
+  end,
+}
+
+-- ---------------------------------------------------------------------------
+-- v0.3: version history panel, undo/redo, retention pruning
+-- ---------------------------------------------------------------------------
+
+local MIKIEDI_REPO = "https://github.com/wyattkuhns/Mikiedi"
+
+mikiedi.json = function(tbl)
+  local ok, out = pcall(js.stringify, tbl)
+  if ok then return out:gsub("<", "\\u003c") end
+  return "{}"
+end
+
+-- Ensures the Mikiedi/Help page exists, then returns its name.
+mikiedi.ensure_help = function()
+  local name = "Mikiedi/Help"
+  local ok, existing = pcall(space.readPage, name)
+  if not (ok and type(existing) == "string" and #existing > 0) then
+    local body = {
+      "# Mikiedi help",
+      "",
+      "Mikiedi is the bridge between this SilverBullet space and a Cadet assistant's memory store.",
+      "Pages you publish here are validated, revision-guarded (CAS), snapshotted, journaled, and versioned",
+      "on the Cadet side. Conflicts are preserved, never auto-resolved.",
+      "",
+      "## Commands",
+      "",
+      "- **Mikiedi: Pull all pages from Cadet** — fetch the whole store into this space (local edits never overwritten).",
+      "- **Mikiedi: Publish current page / Publish pages…** — validated, CAS-guarded publish.",
+      "- **Mikiedi: Refresh from Cadet** — pull the canonical version with conflict safety.",
+      "- **Mikiedi: Delete page from Cadet** — CAS-guarded deletion, pre-image kept.",
+      "- **Mikiedi: Resolve conflict** — keep Cadet's or publish this space's version.",
+      "- **Mikiedi: Show panel** — the log/version panel: recent operations with timestamps,",
+      "  git-style diffs between versions, undo/redo, click-through to pages.",
+      "- **Mikiedi: Undo current page / Redo current page** — step the Cadet page back/forward through recent states.",
+      "- **Mikiedi: Apply retention now** — prune the Cadet-side log and versions per the configured retention.",
+      "- **Mikiedi: Status / Adopt Cadet state** — sync diagnostics and baseline recording.",
+      "",
+      "## Retention settings",
+      "",
+      "Workbench → Configuration → Mikiedi: separate retention for the **log** (the operation journal) and",
+      "**versions** (the full page copies behind diffs and undo/redo). Each takes an amount plus a unit —",
+      "seconds, minutes, hours, days, years — or `forever` (keep everything) / `never`.",
+      "`never` on the log stops recording new entries; `never` on versions disables undo/redo.",
+      "",
+      "## Multiple tabs / sessions",
+      "",
+      "If two SilverBullet tabs have the same page open, publishing from a stale tab is refused with a",
+      "'refresh first' advisory inside a short window after the other tab's publish. Nothing is overwritten",
+      "silently; refresh and publish again.",
+      "",
+      "Repo: " .. MIKIEDI_REPO,
+    }
+    space.writePage(name, table.concat(body, "\n"))
+  end
+  return name
+end
+
+command.define {
+  name = "Mikiedi: Show panel",
+  run = function()
+    local ok, err = pcall(function()
+      local name = editor.getCurrentPage()
+      local slug = nil
+      if not mikiedi.is_excluded(name) then
+        local valid = mikiedi.check_slug(name)
+        if valid then slug = name end
+      end
+
+      local entries = {}
+      local versions, currentHash = {}, nil
+      local undoCount, redoCount = 0, 0
+      local diffs = {}
+
+      local okL, logResp = pcall(mikiedi.call, { op = "log", count = 50 })
+      if okL and logResp.result and logResp.result.entries then entries = logResp.result.entries end
+
+      if slug ~= nil then
+        local okV, vResp = pcall(mikiedi.call, { op = "versions", slug = slug })
+        if okV and vResp.result and vResp.result.versions then
+          versions = vResp.result.versions
+          currentHash = vResp.result.currentHash
+          undoCount = vResp.result.undoCount or 0
+          redoCount = vResp.result.redoCount or 0
+          -- Precompute diffs: consecutive pairs and each recent version vs
+          -- the current state, capped at the 10 most recent versions.
+          local start = math.max(1, #versions - 9)
+          for i = start, #versions do
+            local from = versions[i]
+            local target = "current"
+            local okD, dResp = pcall(mikiedi.call, { op = "diff", slug = slug, from = from.hash or "", to = target })
+            if okD and dResp.result and dResp.result.hunks then
+              table.insert(diffs, { from = from.hash, to = "current", label = "v" .. i .. " → current", hunks = dResp.result.hunks })
+            end
+            if i > start then
+              local okD2, d2 = pcall(mikiedi.call, { op = "diff", slug = slug, from = versions[i - 1].hash or "", to = from.hash or "" })
+              if okD2 and d2.result and d2.result.hunks then
+                table.insert(diffs, { from = versions[i - 1].hash, to = from.hash, label = "v" .. (i - 1) .. " → v" .. i, hunks = d2.result.hunks })
+              end
+            end
+          end
+        end
+      end
+
+      local data = mikiedi.json({
+        slug = slug,
+        currentHash = currentHash,
+        versions = versions,
+        undoCount = undoCount,
+        redoCount = redoCount,
+        entries = entries,
+        diffs = diffs,
+        repo = MIKIEDI_REPO,
+      })
+
+      local html = [[
+<style>
+#mikiedi-root { font-family: var(--ui-font, sans-serif); font-size: 12px; padding: 6px; color: var(--color, #ccc); }
+.mk-toolbar { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 6px; }
+.mk-toolbar button { cursor: pointer; }
+.mk-info { border: 1px solid #555; border-radius: 4px; padding: 6px; margin-bottom: 6px; background: rgba(128,128,128,0.12); }
+.mk-sect { font-weight: bold; margin: 8px 0 4px 0; border-bottom: 1px solid #555; padding-bottom: 2px; }
+.mk-log { max-height: 200px; overflow-y: auto; }
+.mk-log table { width: 100%; border-collapse: collapse; }
+.mk-log td { padding: 1px 4px; border-bottom: 1px solid #333; vertical-align: top; font-size: 11px; }
+.out-published { color: #7ad37a; } .out-created { color: #7ad37a; } .out-resolved { color: #7ad37a; }
+.out-unchanged { color: #999; } .out-deleted { color: #d3a47a; }
+.out-conflict { color: #e0b040; font-weight: bold; } .out-error { color: #e07070; font-weight: bold; }
+.out-stale-editor { color: #e0b040; } .out-adopt-required { color: #e0b040; }
+.mk-rows .mk-row { cursor: pointer; padding: 2px 4px; border-radius: 3px; }
+.mk-rows .mk-row:hover { background: rgba(128,128,128,0.2); }
+.mk-diff { font-family: var(--editor-font, monospace); font-size: 11px; max-height: 260px; overflow: auto; border: 1px solid #444; border-radius: 4px; }
+.mk-diff .dl { white-space: pre-wrap; padding: 0 4px; }
+.mk-diff .add { background: rgba(70,180,70,0.25); color: #9de09d; }
+.mk-diff .del { background: rgba(220,80,80,0.22); color: #e09d9d; text-decoration: none; }
+.mk-diff .ctx { color: #888; }
+.mk-diff .hdr { color: #7aa7d3; padding: 1px 4px; border-top: 1px solid #333; background: rgba(128,128,128,0.08); }
+.mk-btns { display: flex; gap: 4px; margin: 4px 0; }
+.mk-btns button:disabled { opacity: 0.4; cursor: default; }
+.mk-note { color: #999; font-size: 11px; }
+</style>
+<div id="mikiedi-root">
+  <div class="mk-toolbar">
+    <button data-act="config">Config</button>
+    <button data-act="help">Help</button>
+    <button data-act="issues">Issues</button>
+    <button data-act="info">Info</button>
+    <button data-act="refresh" title="Re-fetch log and versions">↻</button>
+  </div>
+  <div id="mk-info" hidden>
+    <b>Mikiedi</b> — a memory wiki editor. This SilverBullet space is a validated,
+    revision-guarded front-end for a Cadet assistant's memory store: publish, sync,
+    resolve conflicts, and inspect history. Never published itself; Cadet's copy is the
+    canonical one. <button data-act="repo">Open repo</button>
+  </div>
+  <div id="mk-versions" class="mk-sect"></div>
+  <div id="mk-undo" class="mk-btns"></div>
+  <div id="mk-diffsel" class="mk-note"></div>
+  <div id="mk-diff" class="mk-diff"></div>
+  <div class="mk-sect">Log</div>
+  <div id="mk-log" class="mk-log"></div>
+</div>
+<script id="mk-data" type="application/json">]] .. data .. [[</script>
+]]
+
+      local script = [[
+const raw = JSON.parse(document.getElementById("mk-data").textContent);
+const data = raw && raw.stringKeys ? raw.stringKeys : raw; // SB Lua->JS wraps the top-level table
+// Lua-built lists arrive as {1:..., 2:...} objects; normalize to real arrays.
+const fixArr = (v) => {
+  // SB serializes pure-Lua tables as {metatable, stringKeys, otherKeys, arrayPart}
+  // wrappers; unwrap those before the numeric-key normalization (diffs is built
+  // in Lua, while bridge-decoded lists arrive as plain JSON arrays).
+  if (v && typeof v === "object" && !Array.isArray(v) && ("arrayPart" in v || "stringKeys" in v)) {
+    const o = {};
+    if (v.arrayPart) for (let i = 0; i < v.arrayPart.length; i++) o[i + 1] = v.arrayPart[i];
+    if (v.stringKeys) for (const k of Object.keys(v.stringKeys)) o[k] = v.stringKeys[k];
+    v = o;
+  }
+  if (Array.isArray(v)) return v.map(fixArr);
+  if (v && typeof v === "object") {
+    const ks = Object.keys(v);
+    if (ks.length > 0 && ks.every((k, i) => k === String(i + 1))) return ks.map((k) => fixArr(v[k]));
+    if (ks.length > 0 && ks.every((k, i) => k === String(i))) return ks.map((k) => fixArr(v[k]));
+    const o = {};
+    for (const k of ks) o[k] = fixArr(v[k]);
+    return o;
+  }
+  return v;
+};
+for (const k of Object.keys(data)) data[k] = fixArr(data[k]);
+const call = (name, ...args) => syscall(name, ...args);
+const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const el = (id) => document.getElementById(id);
+
+// --- toolbar ---
+document.querySelectorAll(".mk-toolbar button").forEach((b) => {
+  b.addEventListener("click", async () => {
+    const act = b.dataset.act;
+    if (act === "config") { await call("editor.invokeCommand", "Workbench: Configuration"); }
+    else if (act === "help") { await call("editor.navigate", "Mikiedi/Help"); }
+    else if (act === "issues") { await call("editor.openUrl", data.repo + "/issues"); }
+    else if (act === "repo") { await call("editor.openUrl", data.repo); }
+    else if (act === "info") { const i = el("mk-info"); i.hidden = !i.hidden; }
+    else if (act === "refresh") { await call("editor.invokeCommand", "Mikiedi: Show panel"); }
+  });
+});
+
+// --- log ---
+const logTbody = [];
+logTbody.push("<table>");
+for (const e of (data.entries || []).slice().reverse()) {
+  const det = esc(e.detail || "").slice(0, 80);
+  logTbody.push("<tr class='mk-row' data-slug='" + esc(e.slug || "") + "'>" +
+    "<td>" + esc((e.at || "").replace("T", " ").replace("Z", "")) + "</td>" +
+    "<td>" + esc(e.op || "") + "</td>" +
+    "<td>" + esc(e.slug || "") + "</td>" +
+    "<td class='out-" + esc(e.outcome || "") + "'>" + esc(e.outcome || "") + "</td>" +
+    "<td>" + det + "</td></tr>");
+}
+logTbody.push("</table>");
+el("mk-log").innerHTML = logTbody.join("");
+el("mk-log").addEventListener("click", (ev) => {
+  const row = ev.target.closest("tr");
+  const slug = row && row.dataset.slug;
+  if (slug) call("editor.navigate", slug);
+});
+
+// --- versions + undo/redo ---
+const versions = data.versions || [];
+const vHead = el("mk-versions");
+if (data.slug) {
+  vHead.textContent = "Versions — " + data.slug;
+} else {
+  vHead.textContent = "Versions (open a publishable page to see its history)";
+}
+const rows = [];
+rows.push("<div class='mk-rows'>");
+versions.slice().reverse().forEach((v, idx) => {
+  const realIdx = versions.length - 1 - idx;
+  const cur = v.hash !== null && v.hash === data.currentHash ? " ·current" : "";
+  rows.push("<div class='mk-row' data-hash='" + esc(v.hash || "") + "'><b>v" + realIdx + "</b> · " +
+    esc((v.ts || "").replace("T", " ").slice(0, 19)) + " · " + esc(v.op || "") + "/" + esc(v.outcome || "") +
+    (v.hash === null ? " · deleted" : "") + cur + "</div>");
+});
+if (versions.length === 0 && data.slug) {
+  rows.push("<div class='mk-note'>No recorded versions yet (version retention may be 'never', or the page was never published from here).</div>");
+}
+rows.push("</div>");
+const container = document.createElement("div");
+container.innerHTML = rows.join("");
+vHead.insertAdjacentElement("afterend", container);
+container.addEventListener("click", (ev) => {
+  const row = ev.target.closest(".mk-row");
+  if (row && row.dataset.hash !== undefined && data.slug) call("editor.navigate", data.slug);
+});
+
+const undoBtn = document.createElement("button");
+undoBtn.textContent = "Undo (" + (data.undoCount || 0) + ")";
+undoBtn.disabled = !(data.undoCount > 0);
+undoBtn.addEventListener("click", () => call("editor.invokeCommand", "Mikiedi: Undo current page"));
+const redoBtn = document.createElement("button");
+redoBtn.textContent = "Redo (" + (data.redoCount || 0) + ")";
+redoBtn.disabled = !(data.redoCount > 0);
+redoBtn.addEventListener("click", () => call("editor.invokeCommand", "Mikiedi: Redo current page"));
+el("mk-undo").appendChild(undoBtn);
+el("mk-undo").appendChild(redoBtn);
+
+// --- diff viewer ---
+const diffs = data.diffs || [];
+const sel = document.createElement("select");
+for (const d of diffs) {
+  const o = document.createElement("option");
+  o.value = d.label;
+  o.textContent = d.label;
+  sel.appendChild(o);
+}
+el("mk-diffsel").innerHTML = "";
+el("mk-diffsel").appendChild(sel);
+el("mk-diffsel").insertAdjacentHTML("beforeend", " <span>compare</span>");
+const renderDiff = () => {
+  const d = diffs.find((x) => x.label === sel.value);
+  const out = [];
+  if (!d) { el("mk-diff").innerHTML = "<div class='ctx'>No diffs available.</div>"; return; }
+  out.push("<div class='hdr'>@@ " + esc(d.label) + " @@</div>");
+  for (const h of d.hunks || []) {
+    out.push("<div class='hdr'>@@ -" + h.aStart + " +" + h.bStart + " @@</div>");
+    for (const l of h.lines || []) {
+      const sign = l.type === "add" ? "+" : l.type === "del" ? "-" : " ";
+      out.push("<div class='dl " + l.type + "'>" + sign + " " + esc(l.text) + "</div>");
+    }
+  }
+  el("mk-diff").innerHTML = out.join("");
+};
+sel.addEventListener("change", renderDiff);
+renderDiff();
+]]
+
+      editor.showPanel("rhs", "0 0 340px", html, script)
+    end)
+    if not ok then editor.alert("Mikiedi error: " .. tostring(err)) end
+  end,
+}
+
+local function apply_undo_redo(label, op)
+  local name = editor.getCurrentPage()
+  if mikiedi.is_excluded(name) then
+    editor.alert("Mikiedi: library/config pages are not part of the bridge.")
+    return
+  end
+  local valid, why = mikiedi.check_slug(name)
+  if not valid then
+    editor.alert(why)
+    return
+  end
+  if not editor.confirm(label .. " the Cadet copy of '" .. name .. "' to its previous state?\n\nThe local copy is replaced with the restored Cadet version (your unpublished local edits to this page would be lost).", { destructive = true }) then
+    return
+  end
+  local resp = mikiedi.call({ op = op, slug = name })
+  local r = resp.result.pages[1]
+  if r.status == "published" then
+    local pr = mikiedi.call({ op = "page", slug = name })
+    if pr.result.content ~= nil then space.writePage(name, pr.result.content) end
+    editor.flashNotification("Mikiedi: " .. label:lower() .. " applied to '" .. name .. "'." .. mikiedi.describe_refresh(resp.result.refresh))
+  elseif r.status == "deleted" then
+    if editor.confirm("The undo restored the state where this page was deleted in Cadet. Also delete the local copy?", { destructive = true }) then
+      space.deletePage(name)
+      editor.flashNotification("Mikiedi: '" .. name .. "' undone to deleted; local copy removed.")
+    end
+  else
+    editor.alert("Mikiedi " .. op .. " result: " .. tostring(r.status) .. " — " .. tostring(r.detail))
+    return
+  end
+end
+
+command.define {
+  name = "Mikiedi: Undo current page",
+  run = function()
+    local ok, err = pcall(function() apply_undo_redo("Undo", "undo") end)
+    if not ok then editor.alert("Mikiedi error: " .. tostring(err)) end
+  end,
+}
+
+command.define {
+  name = "Mikiedi: Redo current page",
+  run = function()
+    local ok, err = pcall(function() apply_undo_redo("Redo", "redo") end)
+    if not ok then editor.alert("Mikiedi error: " .. tostring(err)) end
+  end,
+}
+
+command.define {
+  name = "Mikiedi: Apply retention now",
+  run = function()
+    local ok, err = pcall(function()
+      if not editor.confirm("Prune the Cadet-side log and version history now, per the configured retention?\n\nPruned journal lines are archived on the Cadet side (journal-archive.jsonl), never silently destroyed; pruned version content is removed for good.", { destructive = true }) then
+        return
+      end
+      local resp = mikiedi.call({ op = "prune" })
+      local r = resp.result
+      editor.flashNotification("Mikiedi prune: journal lines archived " .. tostring(r.journalArchived or 0) ..
+        (r.journalCleared and " (log cleared)" or "") ..
+        ", versions removed " .. tostring(r.versionsRemoved or 0) .. ".")
+    end)
+    if not ok then editor.alert("Mikiedi error: " .. tostring(err)) end
+  end,
+}
+
+command.define {
+  name = "Mikiedi: Open help",
+  run = function()
+    local ok, err = pcall(function()
+      local name = mikiedi.ensure_help()
+      editor.navigate(name)
     end)
     if not ok then editor.alert("Mikiedi error: " .. tostring(err)) end
   end,

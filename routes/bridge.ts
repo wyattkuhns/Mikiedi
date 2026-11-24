@@ -39,7 +39,7 @@ export async function POST(request: Request): Promise<Response> {
   }
   if (!payload || typeof payload !== "object" || typeof payload.op !== "string") {
     return jsonResponse(
-      { ok: false, error: "Mikiedi: request body must be a JSON object with an 'op' field (status, pages, page, fetchAll, validate, publish, delete, adopt, resolve, sync, refresh)" },
+      { ok: false, error: "Mikiedi: request body must be a JSON object with an 'op' field (status, pages, page, fetchAll, validate, publish, delete, adopt, resolve, sync, refresh, log, versions, diff, undo, redo, prune)" },
       400,
     );
   }

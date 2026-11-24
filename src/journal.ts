@@ -16,7 +16,8 @@ export interface JournalEntry {
   detail?: string;
 }
 
-export function appendJournal(dataDir: string, entry: JournalEntry): void {
+export function appendJournal(dataDir: string, entry: JournalEntry, opts?: { disabled?: boolean }): void {
+  if (opts?.disabled) return; // log retention "never": stop recording, don't delete history
   mkdirSync(dataDir, { recursive: true });
   appendFileSync(join(dataDir, "journal.jsonl"), `${JSON.stringify(entry)}\n`, "utf8");
 }

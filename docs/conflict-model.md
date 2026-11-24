@@ -37,7 +37,11 @@ Deletion is a separate explicit operation with its own CAS: the request must car
 
 ## The documented race window
 
-The CAS read and the atomic write are not one atomic transaction against Cadet's own writers (consolidation passes, memory tools). A write by another writer inside that window would be overwritten by the bridge's rename. The window is milliseconds and every bridge write is snapshotted, but the operating agreement is: **don't edit the same page in the editor while Cadet-side automation is writing it.** True cross-writer CAS would need an upstream platform primitive (a conditional-write field in native ingest); the bridge documents this gap instead of pretending it away.
+The CAS read and the atomic write are not one atomic transaction against Cadet's own writers (consolidation passes, memory tools). Since v0.3 the bridge **re-hashes the canonical file immediately before every atomic write, delete, and resolve**: an external Cadet-side writer that lands inside the window aborts the op as a conflict instead of being overwritten. The remaining gap is the single instant between that final hash and the rename itself — true cross-writer CAS still needs an upstream platform primitive (a conditional-write field in native ingest), which the bridge documents instead of pretending away. The operating agreement stands: **don't edit the same page in the editor while Cadet-side automation is writing it**, but the bridge now loses nothing even if the agreement is broken.
+
+## Multiple editor sessions (v0.3)
+
+SilverBullet tabs don't see each other's edits. Two tabs with the same page open is the most common way CAS conflicts get churned. v0.3 adds a soft guard on top of CAS: each tab carries a per-session id, and the bridge records the most recent publish per page. A publish from a **different** session within ~90 seconds of another session's publish is refused with a `stale-editor` advisory — nothing is written, no conflict is recorded — telling the user to refresh from Cadet first. Same-session republishes and identical content pass straight through. The guard is advisory, not a lock: after the window (or without a session id, for external callers) normal CAS rules apply.
 
 ## What every operation leaves behind
 

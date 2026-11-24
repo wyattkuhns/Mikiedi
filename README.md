@@ -2,6 +2,8 @@
 
 Mikiedi is a **bridge between [SilverBullet](https://silverbullet.md) and [Cadet](https://www.mycadet.ai) memory**: it lets you view and edit an assistant's concept-page memory wiki in SilverBullet's editor, then publish changes back through a validated, revision-guarded, fully journaled pipeline.
 
+In addition to the concept corpus, the assistant's workspace-root state files — `NOW.md`, `SOUL.md`, `IDENTITY.md`, `HEARTBEAT.md` — appear as regular editable pages (`now`, `soul`, `identity`, `heartbeat`). They carry no frontmatter and cannot be deleted through the bridge.
+
 It is built entirely from each platform's supported extension surfaces:
 
 - **Cadet side: a plugin in TypeScript** — one public ingress route (bearer-verified by the Cadet gateway), backed by an operation engine that enforces the [conflict model](docs/conflict-model.md): full-byte SHA-256 CAS against the canonical store, per-page pre-image snapshots, an append-only journal, atomic writes, and explicit-only conflict resolution.

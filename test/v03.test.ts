@@ -160,7 +160,7 @@ describe("retention", () => {
     const fresh = { at: new Date(now - 1 * 86_400_000).toISOString(), op: "publish", slug: "a", outcome: "updated" };
     appendJournal(dataDir, old);
     appendJournal(dataDir, fresh);
-    const res = pruneJournal(dataDir, { kind: "ttl", ms: 3 * 86_400_000 });
+    const res = pruneJournal(dataDir, { kind: "ttl", ms: 3 * 86_400_000 }, now);
     expect(res.archived).toBe(1);
     const tail = readJournalTail(dataDir, 10);
     expect(tail).toHaveLength(1);
@@ -180,7 +180,8 @@ describe("retention", () => {
   test("pruneVersions respects the TTL and never wipes the store", () => {
     recordVersion(dataDir, "v1", "content A", { ts: "2026-11-01T00:00:00.000Z", op: "publish", outcome: "created" });
     recordVersion(dataDir, "v1", "content B", { ts: "2026-11-18T00:00:00.000Z", op: "publish", outcome: "updated" });
-    const ttl = pruneVersions(dataDir, { kind: "ttl", ms: 3 * 86_400_000 });
+    const now = Date.parse("2026-11-18T12:00:00.000Z");
+    const ttl = pruneVersions(dataDir, { kind: "ttl", ms: 3 * 86_400_000 }, now);
     expect(ttl.removed).toBe(1);
     const index = readVersionIndex(dataDir, "v1");
     expect(index).toHaveLength(1);

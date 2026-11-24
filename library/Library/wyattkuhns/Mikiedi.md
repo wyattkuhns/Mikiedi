@@ -819,6 +819,13 @@ mikiedi.ensure_help = function()
       "- **Mikiedi: Apply retention now** — prune the Cadet-side log and versions per the configured retention.",
       "- **Mikiedi: Status / Adopt Cadet state** — sync diagnostics and baseline recording.",
       "",
+      "## Root pages",
+      "",
+      "The assistant's workspace-root files — `now`, `soul`, `identity`, `heartbeat` — are included",
+      "as regular editable pages. They have no frontmatter and cannot be deleted through the bridge;",
+      "publishing them writes straight back to the assistant's live state files, so treat them with",
+      "the same care as any other page.",
+      "",
       "## Retention settings",
       "",
       "Workbench → Configuration → Mikiedi: separate retention for the **log** (the operation journal) and",
@@ -896,39 +903,69 @@ command.define {
         repo = MIKIEDI_REPO,
       })
 
-      local html = [[
-<style>
-#mikiedi-root { font-family: var(--ui-font, sans-serif); font-size: 12px; padding: 6px; color: var(--color, #ccc); }
+      -- Sample the active theme's computed variables on the main document and
+      -- inline them into the panel: the iframe does not inherit the app's CSS.
+      -- Newer SilverBullet builds also inject the full theme CSS into the
+      -- #sb-theme container; that loads after these definitions, so it wins
+      -- there. On older builds these inline values are what the panel sees.
+      local themeVars = ""
+      pcall(function()
+        local cs = js.window.getComputedStyle(js.window.document.documentElement)
+        local names = {
+          "--root-color", "--root-background-color", "--subtle-color",
+          "--subtle-background-color", "--ui-surface-border-color", "--meta-subtle-color",
+          "--tone-success", "--tone-success-soft", "--tone-warning", "--tone-warning-soft",
+          "--tone-danger", "--tone-danger-soft", "--tone-info", "--tone-info-soft",
+          "--ui-accent-color", "--ui-font", "--editor-monospace-font", "--editor-font",
+        }
+        local defs = {}
+        for _, n in ipairs(names) do
+          local v = cs:getPropertyValue(n)
+          if type(v) == "string" and v ~= "" then
+            v = v:gsub("^%s+", ""):gsub("%s+$", "")
+            if v ~= "" then table.insert(defs, n .. ":" .. v) end
+          end
+        end
+        if #defs > 0 then
+          themeVars = ":root{" .. table.concat(defs, ";") .. "}"
+        end
+      end)
+
+      local html = "<style>" .. themeVars .. [[
+/* Uses SilverBullet theme variables; the #sb-theme container below is where
+   the client injects the active theme's CSS into this panel iframe. */
+#mikiedi-root { font-family: var(--ui-font, sans-serif); font-size: 12px; padding: 6px; color: var(--root-color, inherit); background: var(--root-background-color, transparent); }
 .mk-toolbar { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 6px; }
 .mk-toolbar button { cursor: pointer; }
-.mk-info { border: 1px solid #555; border-radius: 4px; padding: 6px; margin-bottom: 6px; background: rgba(128,128,128,0.12); }
-.mk-sect { font-weight: bold; margin: 8px 0 4px 0; border-bottom: 1px solid #555; padding-bottom: 2px; }
+.mk-info { border: 1px solid var(--ui-surface-border-color, var(--subtle-color, #999)); border-radius: 4px; padding: 6px; margin-bottom: 6px; background: var(--subtle-background-color, transparent); }
+.mk-sect { font-weight: bold; margin: 8px 0 4px 0; border-bottom: 1px solid var(--ui-surface-border-color, var(--subtle-color, #999)); padding-bottom: 2px; }
 .mk-log { max-height: 200px; overflow-y: auto; }
 .mk-log table { width: 100%; border-collapse: collapse; }
-.mk-log td { padding: 1px 4px; border-bottom: 1px solid #333; vertical-align: top; font-size: 11px; }
-.out-published { color: #7ad37a; } .out-created { color: #7ad37a; } .out-resolved { color: #7ad37a; }
-.out-unchanged { color: #999; } .out-deleted { color: #d3a47a; }
-.out-conflict { color: #e0b040; font-weight: bold; } .out-error { color: #e07070; font-weight: bold; }
-.out-stale-editor { color: #e0b040; } .out-adopt-required { color: #e0b040; }
+.mk-log td { padding: 1px 4px; border-bottom: 1px solid var(--ui-surface-border-color, var(--subtle-color, #999)); vertical-align: top; font-size: 11px; }
+.out-published { color: var(--tone-success); } .out-created { color: var(--tone-success); } .out-resolved { color: var(--tone-success); }
+.out-unchanged { color: var(--meta-subtle-color, var(--subtle-color)); } .out-deleted { color: var(--tone-warning); }
+.out-conflict { color: var(--tone-warning); font-weight: bold; } .out-error { color: var(--tone-danger); font-weight: bold; }
+.out-stale-editor { color: var(--tone-warning); } .out-adopt-required { color: var(--tone-warning); }
 .mk-rows .mk-row { cursor: pointer; padding: 2px 4px; border-radius: 3px; }
-.mk-rows .mk-row:hover { background: rgba(128,128,128,0.2); }
-.mk-diff { font-family: var(--editor-font, monospace); font-size: 11px; max-height: 260px; overflow: auto; border: 1px solid #444; border-radius: 4px; }
+.mk-rows .mk-row:hover { background: var(--subtle-background-color); }
+.mk-diff { font-family: var(--editor-monospace-font, var(--editor-font, monospace)); font-size: 11px; max-height: 260px; overflow: auto; border: 1px solid var(--ui-surface-border-color, var(--subtle-color, #999)); border-radius: 4px; background: var(--root-background-color, transparent); }
 .mk-diff .dl { white-space: pre-wrap; padding: 0 4px; }
-.mk-diff .add { background: rgba(70,180,70,0.25); color: #9de09d; }
-.mk-diff .del { background: rgba(220,80,80,0.22); color: #e09d9d; text-decoration: none; }
-.mk-diff .ctx { color: #888; }
-.mk-diff .hdr { color: #7aa7d3; padding: 1px 4px; border-top: 1px solid #333; background: rgba(128,128,128,0.08); }
+.mk-diff .add { background: var(--tone-success-soft); color: var(--tone-success); }
+.mk-diff .del { background: var(--tone-danger-soft); color: var(--tone-danger); text-decoration: none; }
+.mk-diff .ctx { color: var(--meta-subtle-color, var(--subtle-color)); }
+.mk-diff .hdr { color: var(--tone-info, var(--ui-accent-color)); padding: 1px 4px; border-top: 1px solid var(--ui-surface-border-color, var(--subtle-color, #999)); background: var(--subtle-background-color); }
 .mk-btns { display: flex; gap: 4px; margin: 4px 0; }
 .mk-btns button:disabled { opacity: 0.4; cursor: default; }
-.mk-note { color: #999; font-size: 11px; }
+.mk-note { color: var(--meta-subtle-color, var(--subtle-color)); font-size: 11px; }
 </style>
+<div id="sb-theme" hidden></div>
 <div id="mikiedi-root">
   <div class="mk-toolbar">
     <button data-act="config">Config</button>
     <button data-act="help">Help</button>
     <button data-act="issues">Issues</button>
     <button data-act="info">Info</button>
-    <button data-act="refresh" title="Re-fetch log and versions">↻</button>
+    <button data-act="refresh" title="Re-fetch log and versions">Refresh</button>
   </div>
   <div id="mk-info" hidden>
     <b>Mikiedi</b> — a memory wiki editor. This SilverBullet space is a validated,
@@ -981,7 +1018,7 @@ document.querySelectorAll(".mk-toolbar button").forEach((b) => {
   b.addEventListener("click", async () => {
     const act = b.dataset.act;
     if (act === "config") { await call("editor.invokeCommand", "Workbench: Configuration"); }
-    else if (act === "help") { await call("editor.navigate", "Mikiedi/Help"); }
+    else if (act === "help") { await call("editor.invokeCommand", "Mikiedi: Open help"); }
     else if (act === "issues") { await call("editor.openUrl", data.repo + "/issues"); }
     else if (act === "repo") { await call("editor.openUrl", data.repo); }
     else if (act === "info") { const i = el("mk-info"); i.hidden = !i.hidden; }

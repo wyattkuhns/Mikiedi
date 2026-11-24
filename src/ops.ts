@@ -26,7 +26,8 @@ import { sha256Hex, shortHash } from "./revision.ts";
 import { runRebuildIndex, type RefreshResult } from "./refresh.ts";
 import { validateSlug, pagePath } from "./slugs.ts";
 import { loadState, saveState, ensureDataDir, emptyState, type BridgeState } from "./state.ts";
-import { readTextOrNull, writePageAtomic, snapshotPage, writeConflictArtifact, listConceptPages } from "./store.ts";
+import { readBridgePage, writeBridgePageAtomic, snapshotPage, writeConflictArtifact, listBridgePages, deleteBridgePage } from "./store.ts";
+import { isRootSlug } from "./roots.ts";
 import { OpLock } from "./lock.ts";
 import { parseRetention, applyRetention, type Retention, type PruneReport } from "./retention.ts";
 import { recordVersion, readVersionIndex, readVersionContent, findVersionByHash, type VersionEntry } from "./versions.ts";
@@ -100,7 +101,7 @@ function withMutex<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-const PLUGIN_VERSION = "0.3.0";
+const PLUGIN_VERSION = "0.4.0";
 
 function iso(deps: BridgeDeps): string {
   return (deps.now ?? (() => new Date()))().toISOString();
@@ -154,13 +155,25 @@ function stompCheck(
 }
 
 /**
+ * Deletes the store file for a slug. Root assistant files never reach this —
+ * deleteOne and restoreState guard them first — but the guard lives here too
+ * so no future caller can unlink NOW.md by accident.
+ */
+function deleteBridgePage(deps: BridgeDeps, slug: string): void {
+  if (isRootSlug(slug)) {
+    throw new Error("Mikiedi: root assistant files cannot be deleted via the bridge");
+  }
+  unlinkSync(pagePath(deps.config.conceptsDir, slug));
+}
+
+/**
  * CAS window narrowing: re-read and re-hash the canonical file immediately
  * before the atomic write. A Cadet-side writer (native ingest, direct file
  * edits) that lands between the op's initial check and this point aborts
  * the write as a conflict instead of silently clobbering.
  */
 function reVerify(deps: BridgeDeps, slug: string, expectedHash: string | null): { ok: boolean; content: string | null } {
-  const current = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+  const current = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, slug);
   const currentHash = current === null ? null : sha256Hex(current);
   return { ok: currentHash === expectedHash, content: current };
 }
@@ -206,7 +219,7 @@ function restoreState(
   session: string | undefined,
 ): PageOpResult {
   const now = iso(deps);
-  const canonical = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+  const canonical = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, slug);
   const canonicalHash = canonical === null ? null : sha256Hex(canonical);
   if (canonicalHash === target.hash) {
     return { slug, status: "unchanged", detail: `${label}: page is already in the target state.` };
@@ -247,11 +260,14 @@ function restoreState(
   }
 
   if (target.hash === null) {
-    unlinkSync(pagePath(deps.config.conceptsDir, slug));
+    if (isRootSlug(slug)) {
+      return { slug, status: "error", issues: ["root assistant files are protected and cannot be deleted via the bridge"] };
+    }
+    deleteBridgePage(deps, slug);
     state.deleted[slug] = { at: now, hash: canonicalHash! };
     delete state.baselines[slug];
   } else {
-    writePageAtomic(deps.config.conceptsDir, slug, content!);
+    writeBridgePageAtomic(deps.workspaceDir, deps.config.conceptsDir, slug, content!);
     state.baselines[slug] = { hash: target.hash, at: now };
     delete state.deleted[slug];
     // Restoring exactly the kept version demonstrably satisfies keep-cadet.
@@ -320,7 +336,7 @@ async function publishOne(
   if (contentErr) return contentErr;
 
   const now = iso(deps);
-  const canonical = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+  const canonical = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, slug);
   const canonicalHash = canonical === null ? null : sha256Hex(canonical);
   const baseline = state.baselines[slug];
   const conflict = state.conflicts[slug];
@@ -438,7 +454,7 @@ async function publishOne(
   if (canonical !== null) {
     snapshotPage(deps.dataDir, slug, canonical, canonicalHash!, now);
   }
-  writePageAtomic(deps.config.conceptsDir, slug, content);
+  writeBridgePageAtomic(deps.workspaceDir, deps.config.conceptsDir, slug, content);
   const newHash = sha256Hex(content);
   state.baselines[slug] = { hash: newHash, at: now };
   delete state.deleted[slug];
@@ -485,8 +501,15 @@ async function publishOne(
 function deleteOne(deps: BridgeDeps, state: BridgeState, slug: string, baseHash: string | undefined, note?: string, session?: string): PageOpResult {
   const slugErr = slugError(slug);
   if (slugErr) return slugErr;
+  if (isRootSlug(slug)) {
+    return {
+      slug,
+      status: "error",
+      issues: ["root assistant files (NOW, SOUL, IDENTITY, HEARTBEAT) are protected and cannot be deleted via the bridge"],
+    };
+  }
   const now = iso(deps);
-  const canonical = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+  const canonical = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, slug);
   const canonicalHash = canonical === null ? null : sha256Hex(canonical);
 
   if (canonical === null) {
@@ -529,7 +552,7 @@ function deleteOne(deps: BridgeDeps, state: BridgeState, slug: string, baseHash:
     };
   }
   snapshotPage(deps.dataDir, slug, canonical, canonicalHash, now);
-  unlinkSync(pagePath(deps.config.conceptsDir, slug));
+  deleteBridgePage(deps, slug);
   state.deleted[slug] = { at: now, hash: canonicalHash };
   delete state.baselines[slug];
   recordVersion(deps.dataDir, slug, null, { ts: now, op: "delete", outcome: "deleted", sessionId: session, note });
@@ -549,7 +572,7 @@ function deleteOne(deps: BridgeDeps, state: BridgeState, slug: string, baseHash:
 function adoptPages(deps: BridgeDeps, state: BridgeState, slugs: string[] | "all", note?: string): PageOpResult[] {
   const now = iso(deps);
   const targets =
-    slugs === "all" ? listConceptPages(deps.config.conceptsDir).map((p) => p.slug) : (slugs ?? []);
+    slugs === "all" ? listBridgePages(deps.workspaceDir, deps.config.conceptsDir).map((p) => p.slug) : (slugs ?? []);
   const results: PageOpResult[] = [];
   for (const slug of targets) {
     const slugErr = slugError(slug);
@@ -557,7 +580,7 @@ function adoptPages(deps: BridgeDeps, state: BridgeState, slugs: string[] | "all
       results.push(slugErr);
       continue;
     }
-    const canonical = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+    const canonical = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, slug);
     if (canonical === null) {
       results.push({ slug, status: "missing", detail: "No page exists in Cadet memory for this slug." });
       continue;
@@ -593,7 +616,7 @@ function resolveConflict(
   if (!conflict) {
     return { slug, status: "unchanged", detail: "No recorded conflict for this slug." };
   }
-  const canonical = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+  const canonical = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, slug);
   const canonicalHash = canonical === null ? null : sha256Hex(canonical);
 
   if (action === "keep-cadet") {
@@ -642,7 +665,7 @@ function resolveConflict(
     };
   }
   if (canonical !== null) snapshotPage(deps.dataDir, slug, canonical, canonicalHash!, now);
-  writePageAtomic(deps.config.conceptsDir, slug, sbContent);
+  writeBridgePageAtomic(deps.workspaceDir, deps.config.conceptsDir, slug, sbContent);
   const newHash = sha256Hex(sbContent);
   state.baselines[slug] = { hash: newHash, at: now };
   delete state.conflicts[slug];
@@ -664,7 +687,7 @@ function resolveConflict(
 function syncOne(deps: BridgeDeps, state: BridgeState, slug: string, sbContent: string | undefined): SyncVerdict & { slug: string } {
   const slugErr = validateSlug(slug);
   if (slugErr) return { action: "conflict", cadetContent: "", cadetHash: "", artifactDir: "", detail: slugErr };
-  const canonical = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+  const canonical = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, slug);
   const canonicalHash = canonical === null ? null : sha256Hex(canonical);
   const baseline = state.baselines[slug];
   const sbHash = sbContent === undefined ? null : sha256Hex(sbContent);
@@ -798,7 +821,7 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
 
   switch (op) {
     case "status": {
-      const pages = listConceptPages(deps.config.conceptsDir);
+      const pages = listBridgePages(deps.workspaceDir, deps.config.conceptsDir);
       const result: StatusReport = {
         plugin: "mikiedi",
         version: PLUGIN_VERSION,
@@ -814,12 +837,12 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
     }
 
     case "pages": {
-      const pages = listConceptPages(deps.config.conceptsDir).map((p) => ({
+      const pages = listBridgePages(deps.workspaceDir, deps.config.conceptsDir).map((p) => ({
         slug: p.slug,
         size: p.size,
         mtime: p.mtimeIso,
         hash: (() => {
-          const c = readTextOrNull(pagePath(deps.config.conceptsDir, p.slug));
+          const c = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, p.slug);
           return c === null ? null : sha256Hex(c);
         })(),
         lastPublishedAt: state.baselines[p.slug]?.at ?? null,
@@ -833,7 +856,7 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
       const slug = payload.slug;
       const slugErr = slugError(slug);
       if (slugErr) return { ok: true, op: "page", result: slugErr };
-      const content = readTextOrNull(pagePath(deps.config.conceptsDir, slug as string));
+      const content = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, slug as string);
       return {
         ok: true,
         op: "page",
@@ -842,9 +865,9 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
     }
 
     case "fetchAll": {
-      const summaries = listConceptPages(deps.config.conceptsDir);
+      const summaries = listBridgePages(deps.workspaceDir, deps.config.conceptsDir);
       const pages = summaries.map((p) => {
-        const content = readTextOrNull(pagePath(deps.config.conceptsDir, p.slug));
+        const content = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, p.slug);
         return {
           slug: p.slug,
           content: content ?? "",
@@ -991,7 +1014,7 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
       const slug = String(payload.slug ?? "");
       const slugErr = slugError(slug);
       if (slugErr) return { ok: true, op: "versions", result: slugErr };
-      const canonical = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+      const canonical = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, slug);
       return {
         ok: true,
         op: "versions",
@@ -1010,7 +1033,7 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
       if (slugErr) return { ok: true, op: "diff", result: slugErr };
       const resolve = (spec: unknown): { text: string; hash: string | null; error?: string } => {
         if (spec === "current") {
-          const text = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+          const text = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, slug);
           return { text: text ?? "", hash: text === null ? null : sha256Hex(text) };
         }
         if (typeof spec === "string") {
@@ -1058,7 +1081,7 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
         };
       }
       // The state the restore will replace becomes the redo target.
-      const current = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+      const current = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, slug);
       const currentHash = current === null ? null : sha256Hex(current);
       const result = restoreState(deps, state, slug, target, "undo", typeof payload.session === "string" ? payload.session : undefined);
       if (result.status === "published" || result.status === "deleted") {
@@ -1090,7 +1113,7 @@ async function dispatch(deps: BridgeDeps, op: unknown, payload: Record<string, u
           result: { pages: [{ slug, status: "unchanged", detail: "Nothing to redo.", ...stackCounts(state, slug) }] },
         };
       }
-      const current = readTextOrNull(pagePath(deps.config.conceptsDir, slug));
+      const current = readBridgePage(deps.workspaceDir, deps.config.conceptsDir, slug);
       const currentHash = current === null ? null : sha256Hex(current);
       const result = restoreState(deps, state, slug, target, "redo", typeof payload.session === "string" ? payload.session : undefined);
       if (result.status === "published" || result.status === "deleted") {
@@ -1135,7 +1158,9 @@ export function makeDeps(pluginRoot: string): BridgeDeps {
   return {
     config,
     dataDir: `${pluginRoot}/data`,
-    workspaceDir: workspace || config.conceptsDir,
+    // Root-page mapping (NOW/SOUL/IDENTITY/HEARTBEAT) only applies when the
+    // real workspace root is known; without it the helpers no-op.
+    workspaceDir: workspace,
   };
 }
 

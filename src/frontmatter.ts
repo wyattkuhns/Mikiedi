@@ -15,6 +15,8 @@
  * keys, unquoted ": " in values — is rejected with a specific message.
  */
 
+import { isRootSlug } from "./roots.ts";
+
 export interface PageValidation {
   issues: string[];
   warnings: string[];
@@ -156,6 +158,14 @@ export function parseFrontmatter(frontmatterLines: string[]): ParsedFrontmatter 
 export function validatePageContent(content: string, slug: string): PageValidation {
   const issues: string[] = [];
   const warnings: string[] = [];
+
+  if (isRootSlug(slug)) {
+    // Workspace-root assistant files (NOW, SOUL, IDENTITY, HEARTBEAT) are
+    // plain Markdown without frontmatter; only non-emptiness applies.
+    return content.trim() === ""
+      ? { issues: ["page is empty (zero bytes)"], warnings, frontmatter: null }
+      : { issues, warnings, frontmatter: null };
+  }
 
   if (content.length === 0) {
     return { issues: ["page is empty (zero bytes)"], warnings, frontmatter: null };

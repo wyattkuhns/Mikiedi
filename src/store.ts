@@ -18,6 +18,7 @@ import {
 } from "node:fs";
 import { basename, join } from "node:path";
 import { pagePath } from "./slugs.ts";
+import { rootFilePath, ROOT_PAGE_FILES } from "./roots.ts";
 
 export function readTextOrNull(path: string): string | null {
   try {
@@ -44,9 +45,8 @@ function preserveOwnership(target: string, tmpPath: string, hadPrevious: boolean
   }
 }
 
-/** Atomic page write. Returns the absolute path written. */
-export function writePageAtomic(conceptsDir: string, slug: string, content: string): string {
-  const target = pagePath(conceptsDir, slug);
+/** Atomic write to an arbitrary target path. Returns the absolute path written. */
+function writeTargetAtomic(target: string, content: string): string {
   mkdirSync(join(target, ".."), { recursive: true });
   const hadPrevious = existsSync(target);
   const tmp = join(target, "..", `.${basename(target)}.mikiedi-${process.pid}-${Date.now()}.tmp`);
@@ -54,6 +54,40 @@ export function writePageAtomic(conceptsDir: string, slug: string, content: stri
   preserveOwnership(target, tmp, hadPrevious);
   renameSync(tmp, target);
   return target;
+}
+
+/** Atomic page write. Returns the absolute path written. */
+export function writePageAtomic(conceptsDir: string, slug: string, content: string): string {
+  return writeTargetAtomic(pagePath(conceptsDir, slug), content);
+}
+
+/** Atomic write for any bridge page, root files included. */
+export function writeBridgePageAtomic(workspaceDir: string, conceptsDir: string, slug: string, content: string): string {
+  const root = rootFilePath(workspaceDir, slug);
+  return writeTargetAtomic(root ?? pagePath(conceptsDir, slug), content);
+}
+
+/** Read any bridge page, root files included. Returns null when absent. */
+export function readBridgePage(workspaceDir: string, conceptsDir: string, slug: string): string | null {
+  const root = rootFilePath(workspaceDir, slug);
+  return readTextOrNull(root ?? pagePath(conceptsDir, slug));
+}
+
+/** Root files plus the concept corpus, sorted by slug. */
+export function listBridgePages(workspaceDir: string, conceptsDir: string): ConceptSummary[] {
+  const out = listConceptPages(conceptsDir);
+  for (const r of ROOT_PAGE_FILES) {
+    const path = join(workspaceDir, r.filename);
+    let st;
+    try {
+      st = statSync(path);
+    } catch {
+      continue; // Absent root files simply do not appear in the listing.
+    }
+    out.push({ slug: r.slug, size: st.size, mtimeIso: st.mtime.toISOString() });
+  }
+  out.sort((a, b) => a.slug.localeCompare(b.slug));
+  return out;
 }
 
 /** Store a pre-image snapshot before replacing or deleting a page. */

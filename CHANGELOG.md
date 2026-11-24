@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.0 — 2026-11-24
+
+- **Workspace-root files are bridge pages.** `NOW.md`, `SOUL.md`,
+  `IDENTITY.md`, and `HEARTBEAT.md` at the Cadet workspace root are exposed as
+  lowercase slugs (`now`, `soul`, `identity`, `heartbeat`) everywhere pages
+  are listed, fetched, published, diffed, and versioned. They are plain
+  Markdown without frontmatter (concept-page validation does not apply to
+  them) and cannot be deleted through the bridge — they are load-bearing
+  assistant files. Root mapping requires `CADET_WORKSPACE_DIR`; without it the
+  slugs simply do not appear.
+- **Panel follows the SilverBullet theme.** The panel HTML now carries the
+  `#sb-theme` container, so the client injects the active theme's CSS into the
+  iframe, and all panel colors use theme variables (`--root-color`,
+  `--tone-*`, `--ui-surface-border-color`, …). Light and dark schemes both
+  render correctly.
+- **Panel Help button opens real help.** The button now invokes
+  `Mikiedi: Open help` (which creates the `Mikiedi/Help` page with full
+  instructions) instead of navigating straight to a page that may not exist —
+  the old path could leave a blank page behind.
+
 ## 0.3.0 — 2026-11-18
 
 - **Multi-session resiliency.** Cross-process op lock (exclusive lockfile,
